@@ -1,0 +1,79 @@
+{
+  "questions": [
+    {
+      "id": "p4_001",
+      "exam": "C1 Advanced",
+      "paper": "Use of English",
+      "part": 4,
+      "skill": "key_word_transformation",
+      "difficulty": "medium",
+      "tags": ["inversion", "negative_adverbial"],
+      "question": {
+        "first_sentence": "You must not tell anyone about this.",
+        "keyword": "CIRCUMSTANCES",
+        "second_sentence": "Under __________________ anyone about this.",
+        "word_limit_min": 3,
+        "word_limit_max": 6
+      },
+      "answers": ["no circumstances must you tell"],
+      "alternative_answers": ["no circumstances should you tell"],
+      "explanation": "After a negative expression like 'under no circumstances', we use inversion: auxiliary + subject + verb.",
+      "common_errors": [
+        {
+          "answer": "no circumstances you must tell",
+          "reason": "Missing inversion after a negative adverbial."
+        }
+      ]
+    },
+    {
+      "id": "p4_002",
+      "exam": "C1 Advanced",
+      "paper": "Use of English",
+      "part": 4,
+      "skill": "key_word_transformation",
+      "difficulty": "medium",
+      "tags": ["wish", "regret"],
+      "question": {
+        "first_sentence": "I regret not studying harder for the exam.",
+        "keyword": "WISH",
+        "second_sentence": "I __________________ harder for the exam.",
+        "word_limit_min": 3,
+        "word_limit_max": 6
+      },
+      "answers": ["wish I had studied"],
+      "alternative_answers": ["wish that I had studied"],
+      "explanation": "Use wish + past perfect to express regret about a past action.",
+      "common_errors": [
+        {
+          "answer": "wish I studied",
+          "reason": "Use past perfect for a past regret."
+        }
+      ]
+    },
+    {
+      "id": "p4_003",
+      "exam": "C1 Advanced",
+      "paper": "Use of English",
+      "part": 4,
+      "skill": "key_word_transformation",
+      "difficulty": "medium",
+      "tags": ["passive", "reporting"],
+      "question": {
+        "first_sentence": "People believe that the painting is extremely valuable.",
+        "keyword": "BELIEVED",
+        "second_sentence": "The painting __________________ extremely valuable.",
+        "word_limit_min": 3,
+        "word_limit_max": 6
+      },
+      "answers": ["is believed to be"],
+      "alternative_answers": [],
+      "explanation": "A passive reporting structure can be formed with subject + passive reporting verb + to-infinitive.",
+      "common_errors": [
+        {
+          "answer": "believed is to be",
+          "reason": "The passive auxiliary must come before the reporting verb."
+        }
+      ]
+    }
+  ]
+}
