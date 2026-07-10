@@ -65,6 +65,15 @@ button.secondary:hover {
   background: #f5f0e7;
 }
 
+button.danger {
+  background: var(--bad);
+  color: #fff;
+}
+
+button.danger:hover {
+  background: #8f1d14;
+}
+
 input,
 select {
   width: 100%;
@@ -233,6 +242,21 @@ select:focus {
   border-color: rgba(8, 116, 67, 0.3);
   background: #eefbf4;
   color: var(--good);
+}
+
+.alert-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  border-color: rgba(180, 83, 9, 0.35);
+  background: #fff8eb;
+}
+
+.safe-preview {
+  display: grid;
+  gap: 0.9rem;
 }
 
 .table-wrap {

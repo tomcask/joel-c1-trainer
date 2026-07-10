@@ -60,10 +60,13 @@ type Result = {
 type Session = {
   id: string;
   label: string;
+  testId: string;
+  status: "completed";
   startedAt: string;
   finishedAt: string;
   results: Result[];
   summary: Summary;
+  resultJson: SessionResultJson;
 };
 
 type Summary = {
@@ -81,17 +84,75 @@ type StoreState = {
   questions: Question[];
   sessions: Session[];
   importedAt: string | null;
+  lastImport: ImportPreview | null;
 };
 
 type ActiveSession = {
   id: string;
+  testId: string;
   label: string;
   startedAt: number;
+  lastSavedAt: number;
+  status: "in_progress";
   questions: Question[];
   responses: Record<string, ResponseState>;
 };
 
+type SavedActiveSession = ActiveSession & {
+  currentIndex: number;
+  totalTimeMs: number;
+  savedAt: number;
+};
+
+type ImportPreview = {
+  testId: string;
+  name: string;
+  total: number;
+  parts: number[];
+  tags: string[];
+  difficulties: string[];
+  importedAt: string;
+  validationErrors: string[];
+};
+
+type SessionResultJson = {
+  session_id: string;
+  test_id: string;
+  label: string;
+  status: "completed";
+  started_at: string;
+  finished_at: string;
+  total_questions: number;
+  correct: number;
+  incorrect: number;
+  blank: number;
+  accuracy: number;
+  total_time_ms: number;
+  average_time_ms: number;
+  by_tag: Summary["byTag"];
+  responses: Array<{
+    question_id: string;
+    first_sentence: string;
+    keyword: string;
+    second_sentence: string;
+    joel_answer: string;
+    accepted_answers: string[];
+    status: Result["status"];
+    word_count: number;
+    word_limit_ok: boolean;
+    keyword_ok: boolean;
+    answer_match: boolean;
+    time_ms: number;
+    marked_for_review: boolean;
+    tags: string[];
+    explanation: string;
+    common_errors: Array<{ answer: string; reason: string }>;
+  }>;
+};
+
 const STORAGE_KEY = "joel-c1-trainer-state-v1";
+const ACTIVE_SESSION_KEY = "joel-c1-trainer-active-session-v1";
+const ABANDONED_SESSIONS_KEY = "joel-c1-trainer-abandoned-sessions-v1";
 const REQUIRED_FIELDS = [
   "id",
   "part",
@@ -108,15 +169,39 @@ const REQUIRED_FIELDS = [
 function loadState(): StoreState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { questions: [], sessions: [], importedAt: null };
+    if (!raw) return { questions: [], sessions: [], importedAt: null, lastImport: null };
     const parsed = JSON.parse(raw) as Partial<StoreState>;
     return {
       questions: Array.isArray(parsed.questions) ? parsed.questions : [],
-      sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
+      sessions: Array.isArray(parsed.sessions) ? parsed.sessions.map(normalizeStoredSession) : [],
       importedAt: parsed.importedAt ?? null,
+      lastImport: parsed.lastImport ?? null,
     };
   } catch {
-    return { questions: [], sessions: [], importedAt: null };
+    return { questions: [], sessions: [], importedAt: null, lastImport: null };
+  }
+}
+
+function normalizeStoredSession(session: Session): Session {
+  const normalized: Session = {
+    ...session,
+    testId: session.testId ?? makeTestId(session.label ?? "session", session.results?.map((result) => result.question) ?? []),
+    status: "completed",
+    resultJson: session.resultJson ?? ({} as SessionResultJson),
+  };
+  normalized.resultJson = Object.keys(normalized.resultJson).length ? normalized.resultJson : makeSessionResultJson(normalized);
+  return normalized;
+}
+
+function loadSavedActiveSession(): SavedActiveSession | null {
+  try {
+    const raw = localStorage.getItem(ACTIVE_SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as SavedActiveSession;
+    if (parsed.status !== "in_progress" || !Array.isArray(parsed.questions)) return null;
+    return parsed;
+  } catch {
+    return null;
   }
 }
 
@@ -127,9 +212,12 @@ function App() {
   );
   const [message, setMessage] = React.useState<{ type: "ok" | "error"; text: string } | null>(null);
   const [activeSession, setActiveSession] = React.useState<ActiveSession | null>(null);
+  const [savedActiveSession, setSavedActiveSession] = React.useState<SavedActiveSession | null>(loadSavedActiveSession);
   const [currentIndex, setCurrentIndex] = React.useState(0);
   const [now, setNow] = React.useState(Date.now());
   const [reviewFilters, setReviewFilters] = React.useState({ status: "all", tag: "all", repeated: false });
+  const [selectedSessionId, setSelectedSessionId] = React.useState<string | null>(null);
+  const [justCompletedSessionId, setJustCompletedSessionId] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
@@ -146,6 +234,7 @@ function App() {
         const tickNow = Date.now();
         return {
           ...current,
+          lastSavedAt: tickNow,
           responses: {
             ...current.responses,
             [question.id]: {
@@ -160,7 +249,28 @@ function App() {
     return () => window.clearInterval(timer);
   }, [activeSession, currentIndex]);
 
-  const latestSession = store.sessions.at(-1) ?? null;
+  React.useEffect(() => {
+    if (!activeSession) return;
+    saveActiveSession(activeSession, currentIndex);
+    setSavedActiveSession(null);
+  }, [activeSession, currentIndex]);
+
+  React.useEffect(() => {
+    if (!activeSession) return undefined;
+    const saveTimer = window.setInterval(() => saveActiveSession(activeSession, currentIndex), 5000);
+    return () => window.clearInterval(saveTimer);
+  }, [activeSession, currentIndex]);
+
+  React.useEffect(() => {
+    if (!activeSession) return undefined;
+    const handleBeforeUnload = () => saveActiveSession(activeSession, currentIndex);
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [activeSession, currentIndex]);
+
+  const latestSession = selectedSessionId
+    ? (store.sessions.find((session) => session.id === selectedSessionId) ?? store.sessions.at(-1) ?? null)
+    : (store.sessions.at(-1) ?? null);
   const tags = [...new Set(store.questions.flatMap((question) => question.tags))].sort((a, b) => a.localeCompare(b));
 
   function importQuestions(data: unknown) {
@@ -169,10 +279,12 @@ function App() {
       setMessage({ type: "error", text: validation.errors.join(" ") });
       return;
     }
+    const importedAt = new Date().toISOString();
+    const preview = makeImportPreview(validation.questions, "Preguntas importadas", importedAt, validation.errors);
     setStore((current) => {
       const existing = new Map(current.questions.map((question) => [question.id, question]));
       validation.questions.forEach((question) => existing.set(question.id, question));
-      return { ...current, questions: [...existing.values()], importedAt: new Date().toISOString() };
+      return { ...current, questions: [...existing.values()], importedAt, lastImport: preview };
     });
     setMessage({ type: "ok", text: `Importadas ${validation.questions.length} preguntas.` });
     setView("import");
@@ -184,7 +296,25 @@ function App() {
       return;
     }
     try {
-      importQuestions(JSON.parse(await file.text()));
+      const data = JSON.parse(await file.text());
+      const validation = validateQuestionFile(data);
+      if (!validation.ok) {
+        setMessage({ type: "error", text: validation.errors.join(" ") });
+        setStore((current) => ({
+          ...current,
+          lastImport: makeImportPreview([], file.name, new Date().toISOString(), validation.errors),
+        }));
+        return;
+      }
+      const importedAt = new Date().toISOString();
+      const preview = makeImportPreview(validation.questions, file.name, importedAt, []);
+      setStore((current) => {
+        const existing = new Map(current.questions.map((question) => [question.id, question]));
+        validation.questions.forEach((question) => existing.set(question.id, question));
+        return { ...current, questions: [...existing.values()], importedAt, lastImport: preview };
+      });
+      setMessage({ type: "ok", text: `Importadas ${validation.questions.length} preguntas desde ${file.name}.` });
+      setView("import");
     } catch (error) {
       setMessage({ type: "error", text: `JSON no válido: ${(error as Error).message}` });
     }
@@ -201,16 +331,35 @@ function App() {
 
   function startSession(questions: Question[], label: string) {
     if (!questions.length) return;
+    if (activeSession) {
+      const confirmed = window.confirm("Ya hay un examen en curso. ¿Quieres descartarlo y empezar uno nuevo?");
+      if (!confirmed) return;
+      discardActiveSession();
+    }
+    if (savedActiveSession) {
+      const confirmed = window.confirm("Tienes un examen en curso guardado. ¿Quieres descartarlo y empezar uno nuevo?");
+      if (!confirmed) return;
+      discardActiveSession();
+    }
     const responses = Object.fromEntries(questions.map((q) => [q.id, makeResponse(q.id)]));
-    setActiveSession({
+    const startedAt = Date.now();
+    const session: ActiveSession = {
       id: crypto.randomUUID(),
+      testId: makeTestId(label, questions),
       label,
-      startedAt: Date.now(),
+      startedAt,
+      lastSavedAt: startedAt,
+      status: "in_progress",
       questions,
       responses,
+    };
+    saveActiveSession(session, 0);
+    setActiveSession({
+      ...session,
     });
+    setSavedActiveSession(null);
     setCurrentIndex(0);
-    setNow(Date.now());
+    setNow(startedAt);
   }
 
   function patchCurrentResponse(patch: Partial<ResponseState>) {
@@ -221,6 +370,7 @@ function App() {
       const timeNow = Date.now();
       return {
         ...current,
+        lastSavedAt: timeNow,
         responses: {
           ...current.responses,
           [question.id]: {
@@ -245,6 +395,7 @@ function App() {
       const currentResponse = current.responses[currentQuestion.id];
       return {
         ...current,
+        lastSavedAt: timeNow,
         responses: {
           ...current.responses,
           [currentQuestion.id]: {
@@ -280,15 +431,62 @@ function App() {
     );
     const session: Session = {
       id: activeSession.id,
+      testId: activeSession.testId,
       label: activeSession.label,
+      status: "completed",
       startedAt: new Date(activeSession.startedAt).toISOString(),
       finishedAt: new Date(finishedAtMs).toISOString(),
       results,
       summary: summarizeResults(results, activeSession.startedAt, finishedAtMs),
+      resultJson: {} as SessionResultJson,
     };
+    session.resultJson = makeSessionResultJson(session);
     setStore((current) => ({ ...current, sessions: [...current.sessions, session] }));
+    localStorage.removeItem(ACTIVE_SESSION_KEY);
+    setSavedActiveSession(null);
     setActiveSession(null);
+    setSelectedSessionId(session.id);
+    setJustCompletedSessionId(session.id);
     setView("sessions");
+  }
+
+  function continueSavedSession() {
+    if (!savedActiveSession) return;
+    setActiveSession({
+      id: savedActiveSession.id,
+      testId: savedActiveSession.testId,
+      label: savedActiveSession.label,
+      startedAt: savedActiveSession.startedAt,
+      lastSavedAt: Date.now(),
+      status: "in_progress",
+      questions: savedActiveSession.questions,
+      responses: resetResponseTimers(savedActiveSession.responses),
+    });
+    setCurrentIndex(Math.min(savedActiveSession.currentIndex, savedActiveSession.questions.length - 1));
+    setSavedActiveSession(null);
+    setNow(Date.now());
+  }
+
+  function discardActiveSession() {
+    if (activeSession || savedActiveSession) {
+      saveAbandonedSession(activeSession, savedActiveSession, currentIndex);
+      localStorage.removeItem(ACTIVE_SESSION_KEY);
+      setActiveSession(null);
+      setSavedActiveSession(null);
+      setCurrentIndex(0);
+    }
+  }
+
+  function discardSavedSessionWithConfirmation() {
+    if (!window.confirm("¿Seguro que quieres descartar el examen en curso? Se perderán sus respuestas.")) return;
+    discardActiveSession();
+  }
+
+  function deleteSession(sessionId: string) {
+    if (!window.confirm("¿Seguro que quieres borrar esta sesión? Esta acción no se puede deshacer.")) return;
+    setStore((current) => ({ ...current, sessions: current.sessions.filter((session) => session.id !== sessionId) }));
+    if (selectedSessionId === sessionId) setSelectedSessionId(null);
+    if (justCompletedSessionId === sessionId) setJustCompletedSessionId(null);
   }
 
   function startRepeat(mode: string, tag: string) {
@@ -391,6 +589,23 @@ function App() {
 
   return (
     <Shell store={store} onExportJson={() => exportJson(store)} onExportCsv={() => exportCsv(store)}>
+      {savedActiveSession && (
+        <section className="panel alert-panel">
+          <div>
+            <h2>Tienes un examen en curso</h2>
+            <p className="small">
+              {savedActiveSession.label} · Pregunta {savedActiveSession.currentIndex + 1} de{" "}
+              {savedActiveSession.questions.length} · Último guardado: {formatDate(new Date(savedActiveSession.savedAt).toISOString())}
+            </p>
+          </div>
+          <div className="actions">
+            <button onClick={continueSavedSession}>Continuar examen</button>
+            <button className="danger" onClick={discardSavedSessionWithConfirmation}>
+              Descartar examen
+            </button>
+          </div>
+        </section>
+      )}
       <nav className="tabs" aria-label="Secciones">
         {(["home", "import", "sessions", "review", "charts"] as const).map((item) => (
           <button key={item} className={view === item ? "active" : ""} onClick={() => setView(item)}>
@@ -449,7 +664,16 @@ function App() {
         </>
       )}
       {view === "import" && <ImportView store={store} message={message} onImport={importFile} onLoadSample={loadSample} />}
-      {view === "sessions" && <SessionsView sessions={store.sessions} />}
+      {view === "sessions" && (
+        <SessionsView
+          sessions={store.sessions}
+          selectedSessionId={selectedSessionId ?? justCompletedSessionId}
+          justCompletedSessionId={justCompletedSessionId}
+          onSelect={setSelectedSessionId}
+          onDelete={deleteSession}
+          onRepeatFailed={(session) => startSession(getFailedQuestionsFromSession(store, session), `Falladas: ${session.label}`)}
+        />
+      )}
       {view === "review" && (
         <ReviewView
           store={store}
@@ -534,86 +758,154 @@ function ImportView({
         </div>
       </section>
       <section className="panel top-space">
-        <h2>Preguntas cargadas</h2>
-        {store.questions.length ? <QuestionsTable questions={store.questions} /> : <Empty text="Todavía no hay preguntas importadas." />}
+        <h2>Vista previa segura</h2>
+        {store.lastImport ? <SafeImportPreview preview={store.lastImport} /> : <Empty text="Todavía no hay preguntas importadas." />}
       </section>
     </>
   );
 }
 
-function QuestionsTable({ questions }: { questions: Question[] }) {
+function SafeImportPreview({ preview }: { preview: ImportPreview }) {
   return (
-    <div className="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>Keyword</th>
-            <th>Tags</th>
-            <th>Límite</th>
-            <th>Respuestas</th>
-          </tr>
-        </thead>
-        <tbody>
-          {questions.map((q) => (
-            <tr key={q.id}>
-              <td>{q.id}</td>
-              <td>{q.question.keyword}</td>
-              <td>{q.tags.map((tag) => <span className="pill" key={tag}>{tag}</span>)}</td>
-              <td>
-                {q.question.word_limit_min}-{q.question.word_limit_max}
-              </td>
-              <td>{[...q.answers, ...(q.alternative_answers ?? [])].join(" · ")}</td>
-            </tr>
+    <div className="safe-preview">
+      <div className="grid">
+        <Metric value={preview.name} label="test o fichero" />
+        <Metric value={preview.total} label="preguntas" />
+        <Metric value={preview.parts.length ? preview.parts.join(", ") : "-"} label="part" />
+        <Metric value={preview.difficulties.length ? preview.difficulties.join(", ") : "-"} label="dificultad" />
+      </div>
+      <div className="top-space">
+        <strong>Tags detectadas</strong>
+        <div className="actions top-space">
+          {preview.tags.length ? preview.tags.map((tag) => <span className="pill" key={tag}>{tag}</span>) : <span className="small">Sin tags</span>}
+        </div>
+      </div>
+      {!!preview.validationErrors.length && (
+        <div className="message error top-space">
+          {preview.validationErrors.map((error) => (
+            <div key={error}>{error}</div>
           ))}
-        </tbody>
-      </table>
+        </div>
+      )}
+      <p className="small top-space">
+        Esta vista no muestra respuestas, alternativas, explicaciones ni common errors. Esos datos solo aparecen al finalizar una sesión.
+      </p>
     </div>
   );
 }
 
-function SessionsView({ sessions }: { sessions: Session[] }) {
+function SessionsView({
+  sessions,
+  selectedSessionId,
+  justCompletedSessionId,
+  onSelect,
+  onDelete,
+  onRepeatFailed,
+}: {
+  sessions: Session[];
+  selectedSessionId: string | null;
+  justCompletedSessionId: string | null;
+  onSelect: (sessionId: string | null) => void;
+  onDelete: (sessionId: string) => void;
+  onRepeatFailed: (session: Session) => void;
+}) {
   if (!sessions.length) {
     return (
       <section className="panel">
-        <h2>Resultados por sesión</h2>
+        <h2>Historial de sesiones</h2>
         <Empty text="No hay sesiones finalizadas." />
       </section>
     );
   }
+  const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? sessions.at(-1) ?? null;
   return (
-    <section className="panel">
-      <h2>Resultados por sesión</h2>
-      <div className="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Fecha</th>
-              <th>Preguntas</th>
-              <th>Correctas</th>
-              <th>Incorrectas</th>
-              <th>En blanco</th>
-              <th>Acierto</th>
-              <th>Tiempo medio</th>
-            </tr>
-          </thead>
-          <tbody>
-            {sessions
-              .slice()
-              .reverse()
-              .map((session) => (
-                <tr key={session.id}>
-                  <td>{formatDate(session.finishedAt)}</td>
-                  <td>{session.summary.total}</td>
-                  <td>{session.summary.correct}</td>
-                  <td>{session.summary.incorrect}</td>
-                  <td>{session.summary.blank}</td>
-                  <td>{session.summary.accuracy}%</td>
-                  <td>{formatDuration(session.summary.averageTimeMs)}</td>
-                </tr>
-              ))}
-          </tbody>
-        </table>
+    <>
+      {justCompletedSessionId && (
+        <section className="panel message ok">
+          <h2>Resultados guardados</h2>
+          <p>El JSON completo de la sesión se ha generado y guardado en el navegador.</p>
+          <div className="actions">
+            <button onClick={() => selectedSession && downloadSessionJson(selectedSession)}>Descargar JSON de resultados</button>
+            <button className="secondary" onClick={() => selectedSession && downloadSessionCsv(selectedSession)}>
+              Descargar CSV
+            </button>
+          </div>
+        </section>
+      )}
+      <section className="panel top-space">
+        <h2>Historial de sesiones</h2>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Fecha</th>
+                <th>Estado</th>
+                <th>Preguntas</th>
+                <th>Acierto</th>
+                <th>Tiempo medio</th>
+                <th>Acciones</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sessions
+                .slice()
+                .reverse()
+                .map((session) => (
+                  <tr key={session.id}>
+                    <td>{formatDate(session.finishedAt)}</td>
+                    <td><span className="pill good">{session.status}</span></td>
+                    <td>
+                      {session.summary.total} · {session.summary.correct} correctas · {session.summary.incorrect} incorrectas ·{" "}
+                      {session.summary.blank} en blanco
+                    </td>
+                    <td>{session.summary.accuracy}%</td>
+                    <td>{formatDuration(session.summary.averageTimeMs)}</td>
+                    <td>
+                      <div className="actions">
+                        <button className="secondary" onClick={() => onSelect(session.id)}>Ver resultados</button>
+                        <button className="secondary" onClick={() => onRepeatFailed(session)} disabled={!getFailedResults(session).length}>
+                          Repetir falladas
+                        </button>
+                        <button className="secondary" onClick={() => downloadSessionJson(session)}>JSON</button>
+                        <button className="secondary" onClick={() => downloadSessionCsv(session)}>CSV</button>
+                        <button className="danger" onClick={() => onDelete(session.id)}>Borrar</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      {selectedSession && <SessionDetail session={selectedSession} />}
+    </>
+  );
+}
+
+function SessionDetail({ session }: { session: Session }) {
+  const failed = getFailedResults(session);
+  return (
+    <section className="panel top-space">
+      <h2>Resultados de sesión</h2>
+      <div className="grid">
+        <Metric value={session.summary.total} label="preguntas" />
+        <Metric value={session.summary.correct} label="correctas" />
+        <Metric value={session.summary.incorrect} label="incorrectas" />
+        <Metric value={session.summary.blank} label="en blanco" />
+        <Metric value={`${session.summary.accuracy}%`} label="accuracy" />
+        <Metric value={formatDuration(session.summary.totalTimeMs)} label="tiempo total" />
+      </div>
+      <h3 className="top-space">Resumen por tags</h3>
+      <div className="actions">
+        {Object.entries(session.summary.byTag).map(([tag, item]) => (
+          <span className="pill" key={tag}>
+            {tag}: {item.correct}/{item.total}
+          </span>
+        ))}
+      </div>
+      <h3 className="top-space">Errores y respuestas</h3>
+      <div className="review-list">
+        {(failed.length ? failed : session.results).map((result) => <ReviewItem key={result.question.id} result={result} />)}
       </div>
     </section>
   );
@@ -853,6 +1145,91 @@ function validateQuestionFile(data: unknown): { ok: true; errors: []; questions:
   };
 }
 
+function makeImportPreview(questions: Question[], name: string, importedAt: string, validationErrors: string[]): ImportPreview {
+  return {
+    testId: makeTestId(name, questions),
+    name,
+    total: questions.length,
+    parts: [...new Set(questions.map((question) => question.part))].sort((a, b) => a - b),
+    tags: [...new Set(questions.flatMap((question) => question.tags))].sort((a, b) => a.localeCompare(b)),
+    difficulties: [...new Set(questions.map((question) => question.difficulty).filter(Boolean) as string[])].sort((a, b) =>
+      a.localeCompare(b),
+    ),
+    importedAt,
+    validationErrors,
+  };
+}
+
+function makeTestId(label: string, questions: Question[]) {
+  const ids = questions.map((question) => question.id).join("|");
+  return `${slugify(label)}-${hashString(ids).slice(0, 8)}`;
+}
+
+function saveActiveSession(session: ActiveSession, currentIndex: number) {
+  const savedAt = Date.now();
+  const saved: SavedActiveSession = {
+    ...session,
+    currentIndex,
+    totalTimeMs: getActiveSessionTotalTime(session, currentIndex),
+    savedAt,
+    lastSavedAt: savedAt,
+    status: "in_progress",
+  };
+  localStorage.setItem(ACTIVE_SESSION_KEY, JSON.stringify(saved));
+}
+
+function saveAbandonedSession(active: ActiveSession | null, saved: SavedActiveSession | null, currentIndex: number) {
+  const source = saved ?? (active ? { ...active, currentIndex, savedAt: Date.now(), totalTimeMs: getActiveSessionTotalTime(active, currentIndex) } : null);
+  if (!source) return;
+  const existing = readJsonArray(ABANDONED_SESSIONS_KEY);
+  const abandoned = {
+    session_id: source.id,
+    test_id: source.testId,
+    label: source.label,
+    status: "abandoned",
+    started_at: new Date(source.startedAt).toISOString(),
+    abandoned_at: new Date().toISOString(),
+    last_saved_at: new Date(source.savedAt).toISOString(),
+    current_question: source.currentIndex,
+    total_time_ms: source.totalTimeMs,
+    questions: source.questions,
+    responses: source.responses,
+  };
+  localStorage.setItem(ABANDONED_SESSIONS_KEY, JSON.stringify([...existing, abandoned]));
+}
+
+function readJsonArray(key: string): unknown[] {
+  try {
+    const raw = localStorage.getItem(key);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function getActiveSessionTotalTime(session: ActiveSession, currentIndex: number) {
+  const currentQuestion = session.questions[currentIndex];
+  const now = Date.now();
+  return Object.values(session.responses).reduce((sum, response) => {
+    const activeExtra = response.questionId === currentQuestion?.id ? now - response.lastEnteredAt : 0;
+    return sum + response.timeMs + activeExtra;
+  }, 0);
+}
+
+function resetResponseTimers(responses: Record<string, ResponseState>) {
+  const now = Date.now();
+  return Object.fromEntries(
+    Object.entries(responses).map(([questionId, response]) => [
+      questionId,
+      {
+        ...response,
+        lastEnteredAt: now,
+      },
+    ]),
+  );
+}
+
 function makeResponse(questionId: string): ResponseState {
   return { questionId, answer: "", marked: false, timeMs: 0, lastEnteredAt: Date.now() };
 }
@@ -907,6 +1284,43 @@ function summarizeResults(results: Result[], startedAt: number, finishedAt: numb
   };
 }
 
+function makeSessionResultJson(session: Omit<Session, "resultJson"> | Session): SessionResultJson {
+  return {
+    session_id: session.id,
+    test_id: session.testId,
+    label: session.label,
+    status: "completed",
+    started_at: session.startedAt,
+    finished_at: session.finishedAt,
+    total_questions: session.summary.total,
+    correct: session.summary.correct,
+    incorrect: session.summary.incorrect,
+    blank: session.summary.blank,
+    accuracy: session.summary.accuracy,
+    total_time_ms: session.summary.totalTimeMs,
+    average_time_ms: session.summary.averageTimeMs,
+    by_tag: session.summary.byTag,
+    responses: session.results.map((result) => ({
+      question_id: result.question.id,
+      first_sentence: result.question.question.first_sentence,
+      keyword: result.question.question.keyword,
+      second_sentence: result.question.question.second_sentence,
+      joel_answer: result.answer,
+      accepted_answers: result.acceptedAnswers,
+      status: result.status,
+      word_count: result.wordCount,
+      word_limit_ok: result.wordLimitOk,
+      keyword_ok: result.keywordOk,
+      answer_match: result.answerMatch,
+      time_ms: result.timeMs,
+      marked_for_review: result.marked,
+      tags: result.question.tags,
+      explanation: result.question.explanation,
+      common_errors: result.question.common_errors ?? [],
+    })),
+  };
+}
+
 function normalizeAnswer(value: string) {
   return String(value || "")
     .toLowerCase()
@@ -931,6 +1345,15 @@ function getHistoricallyFailedQuestions(store: StoreState, minFailures: number) 
   return store.questions.filter((question) => getFailureCount(store, question.id) >= minFailures);
 }
 
+function getFailedQuestionsFromSession(store: StoreState, session: Session) {
+  const ids = new Set(getFailedResults(session).map((result) => result.question.id));
+  return store.questions.filter((question) => ids.has(question.id));
+}
+
+function getFailedResults(session: Session) {
+  return session.results.filter((result) => result.status !== "correct");
+}
+
 function getFailureCount(store: StoreState, questionId: string) {
   return store.sessions.reduce((count, session) => {
     const result = session.results.find((item) => item.question.id === questionId);
@@ -941,7 +1364,7 @@ function getFailureCount(store: StoreState, questionId: string) {
 function exportJson(store: StoreState) {
   downloadFile(
     `joel-c1-results-${dateStamp()}.json`,
-    JSON.stringify({ exportedAt: new Date().toISOString(), sessions: store.sessions }, null, 2),
+    JSON.stringify({ exportedAt: new Date().toISOString(), sessions: store.sessions.map((session) => session.resultJson) }, null, 2),
     "application/json",
   );
 }
@@ -964,6 +1387,47 @@ function exportCsv(store: StoreState) {
     ]),
   );
   downloadFile(`joel-c1-results-${dateStamp()}.csv`, [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\n"), "text/csv");
+}
+
+function downloadSessionJson(session: Session) {
+  downloadFile(sessionFilename(session, "json"), JSON.stringify(session.resultJson, null, 2), "application/json");
+}
+
+function downloadSessionCsv(session: Session) {
+  const header = [
+    "session_id",
+    "test_id",
+    "finished_at",
+    "question_id",
+    "status",
+    "answer",
+    "accepted_answers",
+    "word_count",
+    "word_limit_ok",
+    "keyword_ok",
+    "time_ms",
+    "tags",
+  ];
+  const rows = session.results.map((result) => [
+    session.id,
+    session.testId,
+    session.finishedAt,
+    result.question.id,
+    result.status,
+    result.answer,
+    result.acceptedAnswers.join(" | "),
+    result.wordCount,
+    result.wordLimitOk,
+    result.keywordOk,
+    result.timeMs,
+    result.question.tags.join(" | "),
+  ]);
+  downloadFile(sessionFilename(session, "csv"), [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\n"), "text/csv");
+}
+
+function sessionFilename(session: Session, extension: "json" | "csv") {
+  const stamp = session.finishedAt.replace(/[-:]/g, "-").replace("T", "-").slice(0, 16);
+  return `joel-c1-advanced-session-${stamp}.${extension}`;
 }
 
 function downloadFile(filename: string, content: string, type: string) {
@@ -999,6 +1463,23 @@ function csvCell(value: unknown) {
 
 function dateStamp() {
   return new Date().toISOString().slice(0, 10);
+}
+
+function slugify(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 40) || "test";
+}
+
+function hashString(value: string) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash << 5) - hash + value.charCodeAt(index);
+    hash |= 0;
+  }
+  return Math.abs(hash).toString(16);
 }
 
 function formatDate(value: string) {
