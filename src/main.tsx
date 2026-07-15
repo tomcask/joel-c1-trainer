@@ -185,6 +185,11 @@ type VocabularyItem = {
   tags: string[];
   difficulty: string;
   source_origin: string;
+  explanation?: string;
+  common_errors?: Array<{ answer: string; reason: string }>;
+  accepted_answers?: string[];
+  distractors?: string[];
+  notes?: string;
 };
 
 type VocabularyPack = {
@@ -196,13 +201,26 @@ type VocabularyPack = {
 };
 
 type VocabularyResponse = {
-  item: VocabularyItem;
+  item?: VocabularyItem;
+  itemId: string;
+  type: VocabularyItemType;
+  term: string;
   mode: VocabularyMode;
   prompt: string;
   userAnswer: string;
   acceptedAnswer: string;
   status: "correct" | "incorrect" | "unsure" | "blank";
   timeMs: number;
+  tags: string[];
+  difficulty: string;
+  sourceOrigin: string;
+  meaningEn: string;
+  meaningEs: string;
+  example: string;
+  pattern: string;
+  explanation?: string;
+  commonErrors: Array<{ answer: string; reason: string }>;
+  feedback: string;
 };
 
 type VocabularySession = {
@@ -263,6 +281,12 @@ type VocabularySessionJson = {
     tags: string[];
     difficulty: string;
     source_origin: string;
+    meaning_en: string;
+    meaning_es: string;
+    example: string;
+    pattern: string;
+    feedback: string;
+    common_errors: Array<{ answer: string; reason: string }>;
   }>;
 };
 
@@ -285,6 +309,28 @@ type VocabularyState = {
   stats: VocabularyStats;
   statsByTag: VocabularyAggregateStats;
   statsByType: VocabularyAggregateStats;
+};
+
+type VocabularyReviewItem = {
+  itemId: string;
+  type: VocabularyItemType | string;
+  term: string;
+  mode: VocabularyMode;
+  prompt: string;
+  userAnswer: string;
+  acceptedAnswer: string;
+  status: VocabularyResponse["status"];
+  timeMs: number;
+  tags: string[];
+  difficulty: string;
+  sourceOrigin: string;
+  meaningEn: string;
+  meaningEs: string;
+  example: string;
+  pattern: string;
+  feedback: string;
+  commonErrors: Array<{ answer: string; reason: string }>;
+  fullExplanationAvailable: boolean;
 };
 
 const STORAGE_KEY = "joel-c1-trainer-state-v1";
@@ -1458,15 +1504,7 @@ function VocabularyView() {
     const itemMode = active.itemModes[item.id];
     const userAnswer = answerOverride ?? active.answer;
     const status = statusOverride ?? gradeVocabularyAnswer(item, itemMode, userAnswer);
-    const response: VocabularyResponse = {
-      item,
-      mode: itemMode,
-      prompt: getVocabularyPrompt(item, itemMode),
-      userAnswer,
-      acceptedAnswer: getVocabularyAcceptedAnswer(item, itemMode),
-      status,
-      timeMs: Date.now() - active.currentStartedAt,
-    };
+    const response = makeVocabularyResponse(item, itemMode, userAnswer, status, Date.now() - active.currentStartedAt);
     const responses = [...active.responses, response];
     if (active.index === active.items.length - 1) {
       finishVocabularySession(active, responses);
@@ -1635,7 +1673,7 @@ function VocabularyView() {
         </div>
       </section>
 
-      <VocabularyHistory sessions={vocab.sessions} stats={vocab.stats} />
+      <VocabularyHistory sessions={vocab.sessions} stats={vocab.stats} packs={vocab.packs} />
     </>
   );
 }
@@ -1661,11 +1699,38 @@ function VocabularyPrompt({ item, mode, revealed }: { item: VocabularyItem; mode
   return <h2>{item.term}</h2>;
 }
 
-function VocabularyHistory({ sessions, stats }: { sessions: VocabularySession[]; stats: VocabularyStats }) {
+function VocabularyHistory({
+  sessions,
+  stats,
+  packs,
+}: {
+  sessions: VocabularySession[];
+  stats: VocabularyStats;
+  packs: VocabularyPack[];
+}) {
+  const [selectedSessionId, setSelectedSessionId] = React.useState<string | null>(sessions.at(-1)?.id ?? null);
+  const [statusFilter, setStatusFilter] = React.useState("all");
+  const [tagFilter, setTagFilter] = React.useState("all");
+  const [typeFilter, setTypeFilter] = React.useState("all");
+  const [difficultyFilter, setDifficultyFilter] = React.useState("all");
   if (!sessions.length) {
     return <section className="panel top-space"><h2>Historial Vocabulary</h2><Empty text="No hay sesiones de vocabulario todavía." /></section>;
   }
   const latest = sessions.at(-1);
+  const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? latest ?? null;
+  const selectedPack = selectedSession ? packs.find((pack) => pack.id === selectedSession.packId) ?? null : null;
+  const reviewItems = selectedSession
+    ? getVocabularyReviewItems(selectedSession, selectedPack).filter((item) => {
+        if (statusFilter !== "all" && item.status !== statusFilter) return false;
+        if (tagFilter !== "all" && !item.tags.includes(tagFilter)) return false;
+        if (typeFilter !== "all" && item.type !== typeFilter) return false;
+        if (difficultyFilter !== "all" && item.difficulty !== difficultyFilter) return false;
+        return true;
+      })
+    : [];
+  const reviewTags = [...new Set(selectedSession ? getVocabularyReviewItems(selectedSession, selectedPack).flatMap((item) => item.tags) : [])].sort();
+  const reviewTypes = [...new Set(selectedSession ? getVocabularyReviewItems(selectedSession, selectedPack).map((item) => item.type) : [])].sort();
+  const reviewDifficulties = [...new Set(selectedSession ? getVocabularyReviewItems(selectedSession, selectedPack).map((item) => item.difficulty) : [])].sort();
   return (
     <section className="panel top-space">
       <h2>Historial Vocabulary</h2>
@@ -1688,6 +1753,9 @@ function VocabularyHistory({ sessions, stats }: { sessions: VocabularySession[];
                 <td>{session.summary.correct}/{session.summary.total} · {session.summary.unsure} unsure · {session.summary.accuracy}%</td>
                 <td>
                   <div className="actions">
+                    <button className={selectedSession?.id === session.id ? "" : "secondary"} onClick={() => setSelectedSessionId(session.id)}>
+                      Ver detalle
+                    </button>
                     <button className="secondary" onClick={() => downloadVocabularyJson(session)}>JSON</button>
                     <button className="secondary" onClick={() => downloadVocabularyCsv(session)}>CSV</button>
                   </div>
@@ -1697,28 +1765,140 @@ function VocabularyHistory({ sessions, stats }: { sessions: VocabularySession[];
           </tbody>
         </table>
       </div>
-      {latest && <VocabularySessionSummary session={latest} />}
+      {selectedSession && (
+        <VocabularySessionDetail
+          session={selectedSession}
+          items={reviewItems}
+          statusFilter={statusFilter}
+          tagFilter={tagFilter}
+          typeFilter={typeFilter}
+          difficultyFilter={difficultyFilter}
+          tags={reviewTags}
+          types={reviewTypes}
+          difficulties={reviewDifficulties}
+          onStatusFilter={setStatusFilter}
+          onTagFilter={setTagFilter}
+          onTypeFilter={setTypeFilter}
+          onDifficultyFilter={setDifficultyFilter}
+        />
+      )}
     </section>
   );
 }
 
-function VocabularySessionSummary({ session }: { session: VocabularySession }) {
+function VocabularySessionDetail({
+  session,
+  items,
+  statusFilter,
+  tagFilter,
+  typeFilter,
+  difficultyFilter,
+  tags,
+  types,
+  difficulties,
+  onStatusFilter,
+  onTagFilter,
+  onTypeFilter,
+  onDifficultyFilter,
+}: {
+  session: VocabularySession;
+  items: VocabularyReviewItem[];
+  statusFilter: string;
+  tagFilter: string;
+  typeFilter: string;
+  difficultyFilter: string;
+  tags: string[];
+  types: string[];
+  difficulties: string[];
+  onStatusFilter: (value: string) => void;
+  onTagFilter: (value: string) => void;
+  onTypeFilter: (value: string) => void;
+  onDifficultyFilter: (value: string) => void;
+}) {
   return (
     <div className="top-space">
-      <h3>Última sesión</h3>
+      <h3>Detalle de sesión</h3>
       <div className="grid">
+        <Metric value={formatDate(session.finishedAt)} label="fecha/hora" />
+        <Metric value={session.packTitle} label="pack" />
+        <Metric value={labelVocabularyMode(session.mode)} label="modo" />
         <Metric value={session.summary.total} label="items" />
         <Metric value={session.summary.correct} label="correctos" />
         <Metric value={session.summary.incorrect} label="incorrectos" />
         <Metric value={session.summary.unsure} label="unsure" />
         <Metric value={session.summary.blank} label="blank" />
+        <Metric value={`${session.summary.accuracy}%`} label="accuracy" />
+        <Metric value={formatDuration(session.summary.totalTimeMs)} label="tiempo total" />
         <Metric value={formatDuration(session.summary.averageTimeMs)} label="tiempo medio" />
       </div>
       <div className="split top-space">
         <SummaryTable title="Por tag" rows={session.summary.byTag} />
         <SummaryTable title="Por type" rows={session.summary.byType} />
       </div>
+      <div className="filter-row top-space">
+        <select value={statusFilter} onChange={(event) => onStatusFilter(event.target.value)}>
+          <option value="all">All</option>
+          <option value="incorrect">Incorrect</option>
+          <option value="unsure">Unsure</option>
+          <option value="blank">Blank</option>
+          <option value="correct">Correct</option>
+        </select>
+        <select value={tagFilter} onChange={(event) => onTagFilter(event.target.value)}>
+          <option value="all">By tag</option>
+          {tags.map((tag) => <option value={tag} key={tag}>{tag}</option>)}
+        </select>
+        <select value={typeFilter} onChange={(event) => onTypeFilter(event.target.value)}>
+          <option value="all">By type</option>
+          {types.map((type) => <option value={type} key={type}>{type}</option>)}
+        </select>
+        <select value={difficultyFilter} onChange={(event) => onDifficultyFilter(event.target.value)}>
+          <option value="all">By difficulty</option>
+          {difficulties.map((difficulty) => <option value={difficulty} key={difficulty}>{difficulty}</option>)}
+        </select>
+      </div>
+      <div className="review-list top-space">
+        {items.length ? items.map((item) => <VocabularyReviewCard key={`${item.itemId}-${item.mode}-${item.timeMs}`} item={item} />) : <Empty text="No hay respuestas con esos filtros." />}
+      </div>
     </div>
+  );
+}
+
+function VocabularyReviewCard({ item }: { item: VocabularyReviewItem }) {
+  const statusClass = item.status === "correct" ? "good" : item.status === "blank" ? "blank" : "bad";
+  const open = item.status !== "correct";
+  return (
+    <details className="review-item" open={open}>
+      <summary className="review-summary">
+        <span className={`pill ${statusClass}`}>{item.status}</span>
+        <strong>{item.term}</strong>
+        <span className="small">{item.type} · {item.difficulty}</span>
+      </summary>
+      <div className="review-body">
+        <p><strong>Prompt:</strong> {item.prompt}</p>
+        <p><strong>Your answer:</strong> {item.userAnswer || "—"}</p>
+        <p><strong>Correct answer:</strong> {item.acceptedAnswer || "—"}</p>
+        <p><strong>Meaning EN:</strong> {item.meaningEn || "—"}</p>
+        <p><strong>Meaning ES:</strong> {item.meaningEs || "—"}</p>
+        <p><strong>Pattern:</strong> {item.pattern || "—"}</p>
+        <p><strong>Example:</strong> {item.example || "—"}</p>
+        <p><strong>Explanation:</strong> {item.feedback}</p>
+        {!!item.commonErrors.length && (
+          <div>
+            <strong>Common errors:</strong>
+            <ul>
+              {item.commonErrors.map((error) => <li key={`${error.answer}-${error.reason}`}>{error.answer}: {error.reason}</li>)}
+            </ul>
+          </div>
+        )}
+        {!item.fullExplanationAvailable && (
+          <p className="small">Full explanation is not available because the original vocabulary item could not be found.</p>
+        )}
+        <div className="actions">
+          {item.tags.map((tag) => <span className="pill" key={tag}>{tag}</span>)}
+          <span className="pill">{item.sourceOrigin || "unknown source"}</span>
+        </div>
+      </div>
+    </details>
   );
 }
 
@@ -1960,7 +2140,7 @@ function loadVocabularyState(): VocabularyState {
     const parsed = JSON.parse(raw) as Partial<VocabularyState>;
     return {
       packs: Array.isArray(parsed.packs) ? parsed.packs : [],
-      sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
+      sessions: Array.isArray(parsed.sessions) ? parsed.sessions.map(normalizeVocabularySession) : [],
       stats: parsed.stats ?? {},
       statsByTag: parsed.statsByTag ?? {},
       statsByType: parsed.statsByType ?? {},
@@ -1968,6 +2148,35 @@ function loadVocabularyState(): VocabularyState {
   } catch {
     return { packs: [], sessions: [], stats: {}, statsByTag: {}, statsByType: {} };
   }
+}
+
+function normalizeVocabularySession(session: VocabularySession): VocabularySession {
+  const responses = Array.isArray(session.responses)
+    ? session.responses.map((response) => ({
+        ...response,
+        itemId: getResponseItemId(response),
+        type: getResponseType(response) as VocabularyItemType,
+        term: getResponseTerm(response),
+        tags: getResponseTags(response),
+        difficulty: getResponseDifficulty(response),
+        sourceOrigin: getResponseSourceOrigin(response),
+        meaningEn: getResponseMeaningEn(response),
+        meaningEs: getResponseMeaningEs(response),
+        example: getResponseExample(response),
+        pattern: getResponsePattern(response),
+        commonErrors: getResponseCommonErrors(response),
+        feedback: getResponseFeedback(response),
+      }))
+    : [];
+  const normalized = {
+    ...session,
+    responses,
+    module: "vocabulary" as const,
+  };
+  return {
+    ...normalized,
+    resultJson: makeVocabularySessionJson(normalized),
+  };
 }
 
 function validateVocabularyPack(data: unknown, fallbackName: string): { ok: true; pack: VocabularyPack } | { ok: false; errors: string[] } {
@@ -1999,6 +2208,9 @@ function validateVocabularyPack(data: unknown, fallbackName: string): { ok: true
       items: (root.items as VocabularyItem[]).map((item) => ({
         ...item,
         tags: item.tags.map(String),
+        common_errors: Array.isArray(item.common_errors) ? item.common_errors : [],
+        accepted_answers: Array.isArray(item.accepted_answers) ? item.accepted_answers : [],
+        distractors: Array.isArray(item.distractors) ? item.distractors : [],
       })),
     },
   };
@@ -2024,18 +2236,75 @@ function getVocabularyAcceptedAnswer(item: VocabularyItem, mode: VocabularyMode)
 
 function gradeVocabularyAnswer(item: VocabularyItem, mode: VocabularyMode, answer: string): VocabularyResponse["status"] {
   if (!normalizeAnswer(answer)) return "blank";
-  return normalizeAnswer(answer) === normalizeAnswer(getVocabularyAcceptedAnswer(item, mode)) ? "correct" : "incorrect";
+  const accepted = getVocabularyAcceptedAnswers(item, mode).map(normalizeAnswer);
+  return accepted.includes(normalizeAnswer(answer)) ? "correct" : "incorrect";
 }
 
 function makeVocabularyOptions(items: VocabularyItem[], item: VocabularyItem) {
   const correct = item.gap_answer;
-  const distractors = shuffle(
+  const explicitDistractors = item.distractors ?? [];
+  const distractors = explicitDistractors.length ? explicitDistractors : shuffle(
     items
       .filter((candidate) => candidate.id !== item.id && (candidate.type === item.type || candidate.tags.some((tag) => item.tags.includes(tag))))
       .map((candidate) => candidate.gap_answer)
       .filter((answer) => normalizeAnswer(answer) !== normalizeAnswer(correct)),
   );
   return shuffle([correct, ...Array.from(new Set(distractors)).slice(0, 3)]);
+}
+
+function getVocabularyAcceptedAnswers(item: VocabularyItem, mode: VocabularyMode) {
+  const primary = getVocabularyAcceptedAnswer(item, mode);
+  if (mode === "gap_fill" || mode === "multiple_choice") return [primary, ...(item.accepted_answers ?? [])];
+  if (mode === "translation") return [primary, ...(item.accepted_answers ?? [])];
+  return [primary];
+}
+
+function makeVocabularyResponse(
+  item: VocabularyItem,
+  mode: VocabularyMode,
+  userAnswer: string,
+  status: VocabularyResponse["status"],
+  timeMs: number,
+): VocabularyResponse {
+  const feedback = makeVocabularyFeedback(item, mode);
+  return {
+    item,
+    itemId: item.id,
+    type: item.type,
+    term: item.term,
+    mode,
+    prompt: getVocabularyPrompt(item, mode),
+    userAnswer,
+    acceptedAnswer: getVocabularyAcceptedAnswer(item, mode),
+    status,
+    timeMs,
+    tags: item.tags,
+    difficulty: item.difficulty,
+    sourceOrigin: item.source_origin,
+    meaningEn: item.meaning_en,
+    meaningEs: item.meaning_es,
+    example: item.example,
+    pattern: item.pattern,
+    explanation: item.explanation,
+    commonErrors: item.common_errors ?? [],
+    feedback,
+  };
+}
+
+function makeVocabularyFeedback(item: VocabularyItem, mode: VocabularyMode) {
+  if (item.explanation) return item.explanation;
+  const accepted = getVocabularyAcceptedAnswer(item, mode);
+  const base =
+    mode === "translation"
+      ? `Expected term: "${accepted}". This means "${item.meaning_en}" (${item.meaning_es}).`
+      : `Expected answer: "${accepted}". "${item.term}" means "${item.meaning_en}" (${item.meaning_es}).`;
+  const pattern = item.pattern ? ` Pattern: ${item.pattern}.` : "";
+  const example = item.example ? ` Example: ${item.example}` : "";
+  const common =
+    item.common_errors?.length
+      ? ` Common errors: ${item.common_errors.map((error) => `${error.answer} (${error.reason})`).join("; ")}.`
+      : " Use the fixed pattern shown above and check the exact form.";
+  return `${base}${pattern}${example}${common}`;
 }
 
 function summarizeVocabulary(responses: VocabularyResponse[], startedAt: number, finishedAt: number): VocabularySummary {
@@ -2047,8 +2316,8 @@ function summarizeVocabulary(responses: VocabularyResponse[], startedAt: number,
   const byTag: VocabularySummary["byTag"] = {};
   const byType: VocabularySummary["byType"] = {};
   responses.forEach((response) => {
-    response.item.tags.forEach((tag) => addVocabularyBucket(byTag, tag, response.status));
-    addVocabularyBucket(byType, response.item.type, response.status);
+    getResponseTags(response).forEach((tag) => addVocabularyBucket(byTag, tag, response.status));
+    addVocabularyBucket(byType, getResponseType(response), response.status);
   });
   finalizeVocabularyBuckets(byTag);
   finalizeVocabularyBuckets(byType);
@@ -2101,27 +2370,118 @@ function makeVocabularySessionJson(session: Omit<VocabularySession, "resultJson"
     by_tag: session.summary.byTag,
     by_type: session.summary.byType,
     responses: session.responses.map((response) => ({
-      item_id: response.item.id,
-      type: response.item.type,
-      term: response.item.term,
+      item_id: getResponseItemId(response),
+      type: getResponseType(response) as VocabularyItemType,
+      term: getResponseTerm(response),
       mode: response.mode,
       prompt: response.prompt,
       user_answer: response.userAnswer,
       accepted_answer: response.acceptedAnswer,
       status: response.status,
       time_ms: response.timeMs,
-      tags: response.item.tags,
-      difficulty: response.item.difficulty,
-      source_origin: response.item.source_origin,
+      tags: getResponseTags(response),
+      difficulty: getResponseDifficulty(response),
+      source_origin: getResponseSourceOrigin(response),
+      meaning_en: getResponseMeaningEn(response),
+      meaning_es: getResponseMeaningEs(response),
+      example: getResponseExample(response),
+      pattern: getResponsePattern(response),
+      feedback: getResponseFeedback(response),
+      common_errors: getResponseCommonErrors(response),
     })),
   };
+}
+
+function getVocabularyReviewItems(session: VocabularySession, pack: VocabularyPack | null): VocabularyReviewItem[] {
+  return session.responses
+    .map((response) => {
+      const sourceItem = response.item ?? pack?.items.find((item) => item.id === getResponseItemId(response));
+      const fallbackFeedback = sourceItem
+        ? makeVocabularyFeedback(sourceItem, response.mode)
+        : "Full explanation is not available because the original vocabulary item could not be found.";
+      return {
+        itemId: getResponseItemId(response),
+        type: sourceItem?.type ?? getResponseType(response),
+        term: sourceItem?.term ?? getResponseTerm(response),
+        mode: response.mode,
+        prompt: response.prompt,
+        userAnswer: response.userAnswer,
+        acceptedAnswer: response.acceptedAnswer,
+        status: response.status,
+        timeMs: response.timeMs,
+        tags: sourceItem?.tags ?? getResponseTags(response),
+        difficulty: sourceItem?.difficulty ?? getResponseDifficulty(response),
+        sourceOrigin: sourceItem?.source_origin ?? getResponseSourceOrigin(response),
+        meaningEn: sourceItem?.meaning_en ?? getResponseMeaningEn(response),
+        meaningEs: sourceItem?.meaning_es ?? getResponseMeaningEs(response),
+        example: sourceItem?.example ?? getResponseExample(response),
+        pattern: sourceItem?.pattern ?? getResponsePattern(response),
+        feedback: response.feedback || sourceItem?.explanation || fallbackFeedback,
+        commonErrors: response.commonErrors ?? sourceItem?.common_errors ?? getResponseCommonErrors(response),
+        fullExplanationAvailable: Boolean(sourceItem || response.feedback || getResponseMeaningEn(response) || getResponsePattern(response)),
+      };
+    })
+    .sort((a, b) => statusPriority(a.status) - statusPriority(b.status));
+}
+
+function statusPriority(status: VocabularyResponse["status"]) {
+  return { incorrect: 0, unsure: 1, blank: 2, correct: 3 }[status];
+}
+
+function getResponseItemId(response: VocabularyResponse) {
+  return response.itemId ?? response.item?.id ?? "unknown_item";
+}
+
+function getResponseType(response: VocabularyResponse) {
+  return response.type ?? response.item?.type ?? "word";
+}
+
+function getResponseTerm(response: VocabularyResponse) {
+  return response.term ?? response.item?.term ?? "Unknown term";
+}
+
+function getResponseTags(response: VocabularyResponse) {
+  return response.tags ?? response.item?.tags ?? [];
+}
+
+function getResponseDifficulty(response: VocabularyResponse) {
+  return response.difficulty ?? response.item?.difficulty ?? "unknown";
+}
+
+function getResponseSourceOrigin(response: VocabularyResponse) {
+  return response.sourceOrigin ?? response.item?.source_origin ?? "unknown";
+}
+
+function getResponseMeaningEn(response: VocabularyResponse) {
+  return response.meaningEn ?? response.item?.meaning_en ?? "";
+}
+
+function getResponseMeaningEs(response: VocabularyResponse) {
+  return response.meaningEs ?? response.item?.meaning_es ?? "";
+}
+
+function getResponseExample(response: VocabularyResponse) {
+  return response.example ?? response.item?.example ?? "";
+}
+
+function getResponsePattern(response: VocabularyResponse) {
+  return response.pattern ?? response.item?.pattern ?? "";
+}
+
+function getResponseCommonErrors(response: VocabularyResponse) {
+  return response.commonErrors ?? response.item?.common_errors ?? [];
+}
+
+function getResponseFeedback(response: VocabularyResponse) {
+  return response.feedback ?? response.item?.explanation ?? "";
 }
 
 function updateVocabularyStats(stats: VocabularyStats, responses: VocabularyResponse[], finishedAt: string) {
   const next = { ...stats };
   responses.forEach((response) => {
-    const current = next[response.item.id] ?? { attempts: 0, correct: 0, incorrect: 0, unsure: 0, lastAttemptAt: finishedAt };
-    next[response.item.id] = {
+    const itemId = getResponseItemId(response);
+    const current = next[itemId] ?? { attempts: 0, correct: 0, incorrect: 0, unsure: 0, lastAttemptAt: finishedAt };
+    next[itemId] = {
       attempts: current.attempts + 1,
       correct: current.correct + (response.status === "correct" ? 1 : 0),
       incorrect: current.incorrect + (response.status === "incorrect" || response.status === "blank" ? 1 : 0),
@@ -2139,7 +2499,7 @@ function updateVocabularyAggregateStats(
 ) {
   const next: VocabularyAggregateStats = { ...(stats ?? {}) };
   responses.forEach((response) => {
-    const keys = dimension === "tag" ? response.item.tags : [response.item.type];
+    const keys = dimension === "tag" ? getResponseTags(response) : [getResponseType(response)];
     keys.forEach((key) => {
       const current = next[key] ?? { attempts: 0, correct: 0, incorrect: 0, unsure: 0 };
       next[key] = {
@@ -2158,21 +2518,22 @@ function downloadVocabularyJson(session: VocabularySession) {
 }
 
 function downloadVocabularyCsv(session: VocabularySession) {
-  const header = ["session_id", "pack_id", "mode", "item_id", "type", "term", "status", "user_answer", "accepted_answer", "time_ms", "tags", "difficulty", "source_origin"];
+  const header = ["session_id", "pack_id", "mode", "item_id", "type", "term", "status", "user_answer", "accepted_answer", "time_ms", "tags", "difficulty", "source_origin", "feedback"];
   const rows = session.responses.map((response) => [
     session.id,
     session.packId,
     response.mode,
-    response.item.id,
-    response.item.type,
-    response.item.term,
+    getResponseItemId(response),
+    getResponseType(response),
+    getResponseTerm(response),
     response.status,
     response.userAnswer,
     response.acceptedAnswer,
     response.timeMs,
-    response.item.tags.join(" | "),
-    response.item.difficulty,
-    response.item.source_origin,
+    getResponseTags(response).join(" | "),
+    getResponseDifficulty(response),
+    getResponseSourceOrigin(response),
+    getResponseFeedback(response),
   ]);
   downloadFile(`joel-c1-vocabulary-session-${session.finishedAt.replace(/[-:]/g, "-").replace("T", "-").slice(0, 16)}.csv`, [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\n"), "text/csv");
 }

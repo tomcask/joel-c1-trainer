@@ -449,6 +449,23 @@ th {
   font-size: 1rem;
 }
 
+.review-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+  cursor: pointer;
+}
+
+.review-body {
+  margin-top: 0.8rem;
+}
+
+.review-body ul {
+  margin: 0.4rem 0 0;
+  padding-left: 1.2rem;
+}
+
 .split {
   display: grid;
   grid-template-columns: 1fr;
