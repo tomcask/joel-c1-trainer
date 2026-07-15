@@ -266,6 +266,12 @@ select:focus {
   gap: 0.9rem;
 }
 
+.choice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.7rem;
+}
+
 .table-wrap {
   overflow-x: auto;
   border: 1px solid var(--line);

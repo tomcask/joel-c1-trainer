@@ -161,9 +161,159 @@ type SessionResultJson = {
   }>;
 };
 
+type VocabularyItemType =
+  | "word"
+  | "expression"
+  | "collocation"
+  | "phrasal_verb"
+  | "verb_pattern"
+  | "adjective_pattern"
+  | "connector";
+
+type VocabularyMode = "flashcard" | "gap_fill" | "multiple_choice" | "translation" | "mixed_review";
+
+type VocabularyItem = {
+  id: string;
+  type: VocabularyItemType;
+  term: string;
+  meaning_en: string;
+  meaning_es: string;
+  example: string;
+  gap_sentence: string;
+  gap_answer: string;
+  pattern: string;
+  tags: string[];
+  difficulty: string;
+  source_origin: string;
+};
+
+type VocabularyPack = {
+  id: string;
+  title: string;
+  metadata: Record<string, unknown>;
+  importedAt: string;
+  items: VocabularyItem[];
+};
+
+type VocabularyResponse = {
+  item: VocabularyItem;
+  mode: VocabularyMode;
+  prompt: string;
+  userAnswer: string;
+  acceptedAnswer: string;
+  status: "correct" | "incorrect" | "unsure" | "blank";
+  timeMs: number;
+};
+
+type VocabularySession = {
+  id: string;
+  student: string;
+  exam: string;
+  module: "vocabulary";
+  packId: string;
+  packTitle: string;
+  mode: VocabularyMode;
+  startedAt: string;
+  finishedAt: string;
+  summary: VocabularySummary;
+  responses: VocabularyResponse[];
+  resultJson: VocabularySessionJson;
+};
+
+type VocabularySummary = {
+  total: number;
+  correct: number;
+  incorrect: number;
+  unsure: number;
+  blank: number;
+  accuracy: number;
+  totalTimeMs: number;
+  averageTimeMs: number;
+  byTag: Record<string, { total: number; correct: number; incorrect: number; unsure: number; blank: number; accuracy: number }>;
+  byType: Record<string, { total: number; correct: number; incorrect: number; unsure: number; blank: number; accuracy: number }>;
+};
+
+type VocabularySessionJson = {
+  session_id: string;
+  student: string;
+  exam: string;
+  module: "vocabulary";
+  pack_id: string;
+  mode: VocabularyMode;
+  started_at: string;
+  finished_at: string;
+  total_items: number;
+  correct: number;
+  incorrect: number;
+  unsure: number;
+  blank: number;
+  accuracy: number;
+  by_tag: VocabularySummary["byTag"];
+  by_type: VocabularySummary["byType"];
+  responses: Array<{
+    item_id: string;
+    type: VocabularyItemType;
+    term: string;
+    mode: VocabularyMode;
+    prompt: string;
+    user_answer: string;
+    accepted_answer: string;
+    status: VocabularyResponse["status"];
+    time_ms: number;
+    tags: string[];
+    difficulty: string;
+    source_origin: string;
+  }>;
+};
+
+type VocabularyStats = Record<
+  string,
+  {
+    attempts: number;
+    correct: number;
+    incorrect: number;
+    unsure: number;
+    lastAttemptAt: string;
+  }
+>;
+
+type VocabularyAggregateStats = Record<string, { attempts: number; correct: number; incorrect: number; unsure: number }>;
+
+type VocabularyState = {
+  packs: VocabularyPack[];
+  sessions: VocabularySession[];
+  stats: VocabularyStats;
+  statsByTag: VocabularyAggregateStats;
+  statsByType: VocabularyAggregateStats;
+};
+
 const STORAGE_KEY = "joel-c1-trainer-state-v1";
+const VOCAB_STORAGE_KEY = "joel-c1-trainer-vocabulary-v1";
 const ACTIVE_SESSION_KEY = "joel-c1-trainer-active-session-v1";
 const ABANDONED_SESSIONS_KEY = "joel-c1-trainer-abandoned-sessions-v1";
+const VOCAB_ALLOWED_TYPES: VocabularyItemType[] = [
+  "word",
+  "expression",
+  "collocation",
+  "phrasal_verb",
+  "verb_pattern",
+  "adjective_pattern",
+  "connector",
+];
+const VOCAB_REQUIRED_FIELDS = [
+  "id",
+  "type",
+  "term",
+  "meaning_en",
+  "meaning_es",
+  "example",
+  "gap_sentence",
+  "gap_answer",
+  "pattern",
+  "tags",
+  "difficulty",
+  "source_origin",
+];
 const REQUIRED_FIELDS = [
   "id",
   "part",
@@ -251,7 +401,7 @@ function loadSavedActiveSession(): SavedActiveSession | null {
 
 function App() {
   const [store, setStore] = React.useState<StoreState>(loadState);
-  const [view, setView] = React.useState<"home" | "import" | "sessions" | "review" | "charts">(
+  const [view, setView] = React.useState<"home" | "import" | "sessions" | "review" | "charts" | "vocabulary">(
     store.tests.length ? "home" : "import",
   );
   const [message, setMessage] = React.useState<{ type: "ok" | "error"; text: string } | null>(null);
@@ -668,7 +818,7 @@ function App() {
         </section>
       )}
       <nav className="tabs" aria-label="Secciones">
-        {(["home", "import", "sessions", "review", "charts"] as const).map((item) => (
+        {(["home", "import", "sessions", "review", "charts", "vocabulary"] as const).map((item) => (
           <button key={item} className={view === item ? "active" : ""} onClick={() => setView(item)}>
             {tabLabel(item)}
           </button>
@@ -770,6 +920,7 @@ function App() {
         />
       )}
       {view === "charts" && <ChartsView sessions={store.sessions} latestSession={latestSession} />}
+      {view === "vocabulary" && <VocabularyView />}
     </Shell>
   );
 }
@@ -1203,6 +1354,398 @@ function ChartPanel({ title, empty, children }: React.PropsWithChildren<{ title:
   );
 }
 
+function VocabularyView() {
+  const [vocab, setVocab] = React.useState<VocabularyState>(loadVocabularyState);
+  const [message, setMessage] = React.useState<{ type: "ok" | "error"; text: string } | null>(null);
+  const [file, setFile] = React.useState<File | undefined>();
+  const [selectedPackId, setSelectedPackId] = React.useState(() => vocab.packs[0]?.id ?? "");
+  const [mode, setMode] = React.useState<VocabularyMode>("mixed_review");
+  const [count, setCount] = React.useState(20);
+  const [tagFilter, setTagFilter] = React.useState("all");
+  const [difficultyFilter, setDifficultyFilter] = React.useState("all");
+  const [sourceFilter, setSourceFilter] = React.useState("all");
+  const [poolFilter, setPoolFilter] = React.useState("all");
+  const [active, setActive] = React.useState<{
+    id: string;
+    pack: VocabularyPack;
+    mode: VocabularyMode;
+    startedAt: number;
+    index: number;
+    items: VocabularyItem[];
+    itemModes: Record<string, VocabularyMode>;
+    responses: VocabularyResponse[];
+    answer: string;
+    flashcardRevealed: boolean;
+    currentStartedAt: number;
+  } | null>(null);
+
+  React.useEffect(() => {
+    localStorage.setItem(VOCAB_STORAGE_KEY, JSON.stringify(vocab));
+  }, [vocab]);
+
+  const selectedPack = vocab.packs.find((pack) => pack.id === selectedPackId) ?? vocab.packs[0] ?? null;
+  const allTags = [...new Set(selectedPack?.items.flatMap((item) => item.tags) ?? [])].sort((a, b) => a.localeCompare(b));
+  const difficulties = [...new Set(selectedPack?.items.map((item) => item.difficulty) ?? [])].sort((a, b) => a.localeCompare(b));
+  const sources = [...new Set(selectedPack?.items.map((item) => item.source_origin) ?? [])].sort((a, b) => a.localeCompare(b));
+
+  async function importVocabularyFile() {
+    if (!file) {
+      setMessage({ type: "error", text: "Selecciona un JSON de vocabulario antes de importar." });
+      return;
+    }
+    try {
+      const data = JSON.parse(await file.text());
+      const validation = validateVocabularyPack(data, file.name);
+      if (!validation.ok) {
+        setMessage({ type: "error", text: validation.errors.join(" ") });
+        return;
+      }
+      const exists = vocab.packs.some((pack) => pack.id === validation.pack.id || pack.title === validation.pack.title);
+      if (exists && !window.confirm(`Ya existe el pack "${validation.pack.title}". ¿Quieres reemplazarlo?`)) return;
+      setVocab((current) => ({
+        ...current,
+        packs: [...current.packs.filter((pack) => pack.id !== validation.pack.id && pack.title !== validation.pack.title), validation.pack],
+      }));
+      setSelectedPackId(validation.pack.id);
+      setMessage({ type: "ok", text: `Importado ${validation.pack.title} con ${validation.pack.items.length} items.` });
+    } catch (error) {
+      setMessage({ type: "error", text: `JSON no válido: ${(error as Error).message}` });
+    }
+  }
+
+  function buildVocabularyPool(pack: VocabularyPack) {
+    return pack.items.filter((item) => {
+      if (tagFilter !== "all" && !item.tags.includes(tagFilter)) return false;
+      if (difficultyFilter !== "all" && item.difficulty !== difficultyFilter) return false;
+      if (sourceFilter !== "all" && item.source_origin !== sourceFilter) return false;
+      const stats = vocab.stats[item.id];
+      if (poolFilter === "failed" && (!stats || stats.incorrect < 1)) return false;
+      if (poolFilter === "failed_twice" && (!stats || stats.incorrect < 2)) return false;
+      if (poolFilter === "unsure" && (!stats || stats.unsure < 1)) return false;
+      if (poolFilter === "chatgpt" && !item.source_origin.toLowerCase().includes("chatgpt")) return false;
+      if (poolFilter === "joel_pdf" && !item.source_origin.toLowerCase().includes("joel_pdf")) return false;
+      return true;
+    });
+  }
+
+  function startVocabularySession() {
+    if (!selectedPack) return;
+    const pool = buildVocabularyPool(selectedPack);
+    if (!pool.length) {
+      setMessage({ type: "error", text: "No hay items con esos filtros." });
+      return;
+    }
+    const items = shuffle(pool).slice(0, Math.min(count, pool.length));
+    const itemModes = Object.fromEntries(items.map((item, index) => [item.id, resolveVocabularyMode(mode, index)]));
+    setActive({
+      id: crypto.randomUUID(),
+      pack: selectedPack,
+      mode,
+      startedAt: Date.now(),
+      index: 0,
+      items,
+      itemModes,
+      responses: [],
+      answer: "",
+      flashcardRevealed: false,
+      currentStartedAt: Date.now(),
+    });
+  }
+
+  function answerVocabulary(statusOverride?: VocabularyResponse["status"], answerOverride?: string) {
+    if (!active) return;
+    const item = active.items[active.index];
+    const itemMode = active.itemModes[item.id];
+    const userAnswer = answerOverride ?? active.answer;
+    const status = statusOverride ?? gradeVocabularyAnswer(item, itemMode, userAnswer);
+    const response: VocabularyResponse = {
+      item,
+      mode: itemMode,
+      prompt: getVocabularyPrompt(item, itemMode),
+      userAnswer,
+      acceptedAnswer: getVocabularyAcceptedAnswer(item, itemMode),
+      status,
+      timeMs: Date.now() - active.currentStartedAt,
+    };
+    const responses = [...active.responses, response];
+    if (active.index === active.items.length - 1) {
+      finishVocabularySession(active, responses);
+      return;
+    }
+    setActive({
+      ...active,
+      responses,
+      index: active.index + 1,
+      answer: "",
+      flashcardRevealed: false,
+      currentStartedAt: Date.now(),
+    });
+  }
+
+  function finishVocabularySession(current: NonNullable<typeof active>, responses: VocabularyResponse[]) {
+    const finishedAt = Date.now();
+    const summary = summarizeVocabulary(responses, current.startedAt, finishedAt);
+    const session: VocabularySession = {
+      id: current.id,
+      student: String(current.pack.metadata.student ?? "Joel"),
+      exam: String(current.pack.metadata.exam ?? "C1 Advanced"),
+      module: "vocabulary",
+      packId: current.pack.id,
+      packTitle: current.pack.title,
+      mode: current.mode,
+      startedAt: new Date(current.startedAt).toISOString(),
+      finishedAt: new Date(finishedAt).toISOString(),
+      summary,
+      responses,
+      resultJson: {} as VocabularySessionJson,
+    };
+    session.resultJson = makeVocabularySessionJson(session);
+    setVocab((currentState) => ({
+      ...currentState,
+      sessions: [...currentState.sessions, session],
+      stats: updateVocabularyStats(currentState.stats, responses, session.finishedAt),
+      statsByTag: updateVocabularyAggregateStats(currentState.statsByTag, responses, "tag"),
+      statsByType: updateVocabularyAggregateStats(currentState.statsByType, responses, "type"),
+    }));
+    setActive(null);
+  }
+
+  if (active) {
+    const item = active.items[active.index];
+    const itemMode = active.itemModes[item.id];
+    const options = itemMode === "multiple_choice" ? makeVocabularyOptions(active.pack.items, item) : [];
+    return (
+      <section className="panel">
+        <div className="exam-header">
+          <div className="exam-meta">
+            <strong>
+              Vocabulary · {active.index + 1} de {active.items.length}
+            </strong>
+            <span className="timer">{active.pack.title}</span>
+          </div>
+          <div className="progress-track">
+            <div className="progress-fill" style={{ width: `${((active.index + 1) / active.items.length) * 100}%` }} />
+          </div>
+        </div>
+        <article className="question-card">
+          <div className="pill">{labelVocabularyMode(itemMode)}</div>
+          <VocabularyPrompt item={item} mode={itemMode} revealed={active.flashcardRevealed} />
+          {itemMode === "flashcard" ? (
+            <>
+              {!active.flashcardRevealed && <button onClick={() => setActive({ ...active, flashcardRevealed: true })}>Reveal</button>}
+              <div className="actions">
+                <button onClick={() => answerVocabulary("correct", "I knew it")}>I knew it</button>
+                <button className="secondary" onClick={() => answerVocabulary("unsure", "I was unsure")}>I was unsure</button>
+                <button className="danger" onClick={() => answerVocabulary("incorrect", "I did not know it")}>I did not know it</button>
+              </div>
+            </>
+          ) : itemMode === "multiple_choice" ? (
+            <div className="choice-grid">
+              {options.map((option) => (
+                <button className="secondary" key={option} onClick={() => answerVocabulary(undefined, option)}>
+                  {option}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="actions">
+              <input
+                value={active.answer}
+                onChange={(event) => setActive({ ...active, answer: event.target.value })}
+                placeholder="Escribe la respuesta"
+                autoFocus
+              />
+              <button onClick={() => answerVocabulary()}>Responder</button>
+              <button className="secondary" onClick={() => answerVocabulary("blank", "")}>Dejar en blanco</button>
+            </div>
+          )}
+        </article>
+      </section>
+    );
+  }
+
+  return (
+    <>
+      <section className="panel">
+        <h1>Vocabulary</h1>
+        <p className="lead">Práctica separada de vocabulario C1: flashcards, gap fill, multiple choice, translation y mixed review.</p>
+        <div className="import-box">
+          <input type="file" accept="application/json,.json" onChange={(event) => setFile(event.target.files?.[0])} />
+          <div className="actions">
+            <button onClick={importVocabularyFile}>Importar pack de Vocabulary</button>
+          </div>
+          {message && <div className={`message ${message.type}`}>{message.text}</div>}
+        </div>
+      </section>
+
+      <section className="layout two top-space">
+        <div className="panel">
+          <h2>Configurar sesión</h2>
+          <div className="filter-row">
+            <select value={selectedPackId} onChange={(event) => setSelectedPackId(event.target.value)} disabled={!vocab.packs.length}>
+              {vocab.packs.map((pack) => (
+                <option key={pack.id} value={pack.id}>{pack.title} ({pack.items.length})</option>
+              ))}
+            </select>
+            <select value={mode} onChange={(event) => setMode(event.target.value as VocabularyMode)}>
+              <option value="flashcard">Flashcard</option>
+              <option value="gap_fill">Gap fill</option>
+              <option value="multiple_choice">Multiple choice</option>
+              <option value="translation">Translation recall</option>
+              <option value="mixed_review">Mixed review</option>
+            </select>
+            <input type="number" min={1} max={200} value={count} onChange={(event) => setCount(Number(event.target.value))} />
+            <select value={tagFilter} onChange={(event) => setTagFilter(event.target.value)}>
+              <option value="all">Todos los tags</option>
+              {allTags.map((tag) => <option key={tag} value={tag}>{tag}</option>)}
+            </select>
+            <select value={difficultyFilter} onChange={(event) => setDifficultyFilter(event.target.value)}>
+              <option value="all">Todas las dificultades</option>
+              {difficulties.map((difficulty) => <option key={difficulty} value={difficulty}>{difficulty}</option>)}
+            </select>
+            <select value={sourceFilter} onChange={(event) => setSourceFilter(event.target.value)}>
+              <option value="all">Todos los orígenes</option>
+              {sources.map((source) => <option key={source} value={source}>{source}</option>)}
+            </select>
+            <select value={poolFilter} onChange={(event) => setPoolFilter(event.target.value)}>
+              <option value="all">Usar todos</option>
+              <option value="failed">Solo fallados</option>
+              <option value="failed_twice">Fallados más de una vez</option>
+              <option value="unsure">Solo inseguros</option>
+              <option value="chatgpt">Solo añadidos por ChatGPT</option>
+              <option value="joel_pdf">Solo PDF de Joel</option>
+            </select>
+            <button disabled={!selectedPack} onClick={startVocabularySession}>Empezar Vocabulary</button>
+          </div>
+        </div>
+        <div className="panel">
+          <h2>Packs</h2>
+          {vocab.packs.length ? (
+            <div className="review-list">
+              {vocab.packs.map((pack) => (
+                <div className="metric" key={pack.id}>
+                  <strong>{pack.title}</strong>
+                  <span>{pack.items.length} items · {String(pack.metadata.exam ?? "C1 Advanced")}</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <Empty text="Importa un pack JSON de Vocabulary para empezar." />
+          )}
+        </div>
+      </section>
+
+      <VocabularyHistory sessions={vocab.sessions} stats={vocab.stats} />
+    </>
+  );
+}
+
+function VocabularyPrompt({ item, mode, revealed }: { item: VocabularyItem; mode: VocabularyMode; revealed: boolean }) {
+  if (mode === "flashcard") {
+    return (
+      <div>
+        <h2>{item.term}</h2>
+        {revealed && (
+          <div className="review-item">
+            <p><strong>Meaning EN:</strong> {item.meaning_en}</p>
+            <p><strong>Meaning ES:</strong> {item.meaning_es}</p>
+            <p><strong>Example:</strong> {item.example}</p>
+            <p><strong>Pattern:</strong> {item.pattern}</p>
+          </div>
+        )}
+      </div>
+    );
+  }
+  if (mode === "gap_fill" || mode === "multiple_choice") return <h2>{item.gap_sentence}</h2>;
+  if (mode === "translation") return <h2>{item.meaning_es}</h2>;
+  return <h2>{item.term}</h2>;
+}
+
+function VocabularyHistory({ sessions, stats }: { sessions: VocabularySession[]; stats: VocabularyStats }) {
+  if (!sessions.length) {
+    return <section className="panel top-space"><h2>Historial Vocabulary</h2><Empty text="No hay sesiones de vocabulario todavía." /></section>;
+  }
+  const latest = sessions.at(-1);
+  return (
+    <section className="panel top-space">
+      <h2>Historial Vocabulary</h2>
+      <div className="grid">
+        <Metric value={Object.keys(stats).length} label="items practicados" />
+        <Metric value={sessions.length} label="sesiones" />
+        <Metric value={latest ? `${latest.summary.accuracy}%` : "-"} label="último accuracy" />
+      </div>
+      <div className="table-wrap top-space">
+        <table>
+          <thead>
+            <tr><th>Fecha</th><th>Pack</th><th>Modo</th><th>Resultado</th><th>Acciones</th></tr>
+          </thead>
+          <tbody>
+            {sessions.slice().reverse().map((session) => (
+              <tr key={session.id}>
+                <td>{formatDate(session.finishedAt)}</td>
+                <td>{session.packTitle}</td>
+                <td>{labelVocabularyMode(session.mode)}</td>
+                <td>{session.summary.correct}/{session.summary.total} · {session.summary.unsure} unsure · {session.summary.accuracy}%</td>
+                <td>
+                  <div className="actions">
+                    <button className="secondary" onClick={() => downloadVocabularyJson(session)}>JSON</button>
+                    <button className="secondary" onClick={() => downloadVocabularyCsv(session)}>CSV</button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {latest && <VocabularySessionSummary session={latest} />}
+    </section>
+  );
+}
+
+function VocabularySessionSummary({ session }: { session: VocabularySession }) {
+  return (
+    <div className="top-space">
+      <h3>Última sesión</h3>
+      <div className="grid">
+        <Metric value={session.summary.total} label="items" />
+        <Metric value={session.summary.correct} label="correctos" />
+        <Metric value={session.summary.incorrect} label="incorrectos" />
+        <Metric value={session.summary.unsure} label="unsure" />
+        <Metric value={session.summary.blank} label="blank" />
+        <Metric value={formatDuration(session.summary.averageTimeMs)} label="tiempo medio" />
+      </div>
+      <div className="split top-space">
+        <SummaryTable title="Por tag" rows={session.summary.byTag} />
+        <SummaryTable title="Por type" rows={session.summary.byType} />
+      </div>
+    </div>
+  );
+}
+
+function SummaryTable({
+  title,
+  rows,
+}: {
+  title: string;
+  rows: Record<string, { total: number; correct: number; incorrect: number; unsure: number; blank: number; accuracy: number }>;
+}) {
+  return (
+    <div>
+      <h3>{title}</h3>
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>Grupo</th><th>Total</th><th>Correct</th><th>Incorrect</th><th>Unsure</th><th>Accuracy</th></tr></thead>
+          <tbody>
+            {Object.entries(rows).map(([key, row]) => (
+              <tr key={key}><td>{key}</td><td>{row.total}</td><td>{row.correct}</td><td>{row.incorrect}</td><td>{row.unsure}</td><td>{row.accuracy}%</td></tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function RepeatPanel({ tags, onStart }: { tags: string[]; onStart: (mode: string, tag: string) => void }) {
   const [mode, setMode] = React.useState("last");
   const [tag, setTag] = React.useState(tags[0] ?? "");
@@ -1408,6 +1951,244 @@ function readJsonArray(key: string): unknown[] {
   } catch {
     return [];
   }
+}
+
+function loadVocabularyState(): VocabularyState {
+  try {
+    const raw = localStorage.getItem(VOCAB_STORAGE_KEY);
+    if (!raw) return { packs: [], sessions: [], stats: {}, statsByTag: {}, statsByType: {} };
+    const parsed = JSON.parse(raw) as Partial<VocabularyState>;
+    return {
+      packs: Array.isArray(parsed.packs) ? parsed.packs : [],
+      sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
+      stats: parsed.stats ?? {},
+      statsByTag: parsed.statsByTag ?? {},
+      statsByType: parsed.statsByType ?? {},
+    };
+  } catch {
+    return { packs: [], sessions: [], stats: {}, statsByTag: {}, statsByType: {} };
+  }
+}
+
+function validateVocabularyPack(data: unknown, fallbackName: string): { ok: true; pack: VocabularyPack } | { ok: false; errors: string[] } {
+  const root = data as { metadata?: Record<string, unknown>; items?: unknown };
+  const errors: string[] = [];
+  if (!root || typeof root !== "object") return { ok: false, errors: ["El JSON de Vocabulary debe ser un objeto."] };
+  if (!Array.isArray(root.items)) return { ok: false, errors: ["Falta items o no es un array."] };
+  root.items.forEach((raw, index) => {
+    const item = raw as Partial<VocabularyItem>;
+    const prefix = `Item ${index + 1}${item.id ? ` (${item.id})` : ""}:`;
+    VOCAB_REQUIRED_FIELDS.forEach((field) => {
+      const value = getPath(item, field);
+      if (value === undefined || value === null || value === "") errors.push(`${prefix} falta ${field}.`);
+    });
+    if (item.type && !VOCAB_ALLOWED_TYPES.includes(item.type)) errors.push(`${prefix} type no permitido: ${item.type}.`);
+    if (item.tags && !Array.isArray(item.tags)) errors.push(`${prefix} tags debe ser un array.`);
+  });
+  if (errors.length) return { ok: false, errors };
+  const metadata = root.metadata ?? {};
+  const title = String(metadata.title ?? fallbackName.replace(/\.json$/i, "") ?? "Vocabulary pack");
+  const id = slugify(String(metadata.title ?? fallbackName.replace(/\.json$/i, "")));
+  return {
+    ok: true,
+    pack: {
+      id,
+      title,
+      metadata,
+      importedAt: new Date().toISOString(),
+      items: (root.items as VocabularyItem[]).map((item) => ({
+        ...item,
+        tags: item.tags.map(String),
+      })),
+    },
+  };
+}
+
+function resolveVocabularyMode(mode: VocabularyMode, index: number): VocabularyMode {
+  if (mode !== "mixed_review") return mode;
+  return (["flashcard", "gap_fill", "multiple_choice", "translation"] as VocabularyMode[])[index % 4];
+}
+
+function getVocabularyPrompt(item: VocabularyItem, mode: VocabularyMode) {
+  if (mode === "flashcard") return item.term;
+  if (mode === "gap_fill" || mode === "multiple_choice") return item.gap_sentence;
+  if (mode === "translation") return item.meaning_es;
+  return item.term;
+}
+
+function getVocabularyAcceptedAnswer(item: VocabularyItem, mode: VocabularyMode) {
+  if (mode === "gap_fill" || mode === "multiple_choice") return item.gap_answer;
+  if (mode === "translation") return item.term;
+  return item.term;
+}
+
+function gradeVocabularyAnswer(item: VocabularyItem, mode: VocabularyMode, answer: string): VocabularyResponse["status"] {
+  if (!normalizeAnswer(answer)) return "blank";
+  return normalizeAnswer(answer) === normalizeAnswer(getVocabularyAcceptedAnswer(item, mode)) ? "correct" : "incorrect";
+}
+
+function makeVocabularyOptions(items: VocabularyItem[], item: VocabularyItem) {
+  const correct = item.gap_answer;
+  const distractors = shuffle(
+    items
+      .filter((candidate) => candidate.id !== item.id && (candidate.type === item.type || candidate.tags.some((tag) => item.tags.includes(tag))))
+      .map((candidate) => candidate.gap_answer)
+      .filter((answer) => normalizeAnswer(answer) !== normalizeAnswer(correct)),
+  );
+  return shuffle([correct, ...Array.from(new Set(distractors)).slice(0, 3)]);
+}
+
+function summarizeVocabulary(responses: VocabularyResponse[], startedAt: number, finishedAt: number): VocabularySummary {
+  const total = responses.length;
+  const correct = responses.filter((response) => response.status === "correct").length;
+  const incorrect = responses.filter((response) => response.status === "incorrect").length;
+  const unsure = responses.filter((response) => response.status === "unsure").length;
+  const blank = responses.filter((response) => response.status === "blank").length;
+  const byTag: VocabularySummary["byTag"] = {};
+  const byType: VocabularySummary["byType"] = {};
+  responses.forEach((response) => {
+    response.item.tags.forEach((tag) => addVocabularyBucket(byTag, tag, response.status));
+    addVocabularyBucket(byType, response.item.type, response.status);
+  });
+  finalizeVocabularyBuckets(byTag);
+  finalizeVocabularyBuckets(byType);
+  return {
+    total,
+    correct,
+    incorrect,
+    unsure,
+    blank,
+    accuracy: total ? Math.round((correct / total) * 1000) / 10 : 0,
+    totalTimeMs: finishedAt - startedAt,
+    averageTimeMs: total ? Math.round(responses.reduce((sum, response) => sum + response.timeMs, 0) / total) : 0,
+    byTag,
+    byType,
+  };
+}
+
+function addVocabularyBucket(
+  buckets: VocabularySummary["byTag"],
+  key: string,
+  status: VocabularyResponse["status"],
+) {
+  buckets[key] ||= { total: 0, correct: 0, incorrect: 0, unsure: 0, blank: 0, accuracy: 0 };
+  buckets[key].total += 1;
+  buckets[key][status] += 1;
+}
+
+function finalizeVocabularyBuckets(buckets: VocabularySummary["byTag"]) {
+  Object.values(buckets).forEach((bucket) => {
+    bucket.accuracy = bucket.total ? Math.round((bucket.correct / bucket.total) * 1000) / 10 : 0;
+  });
+}
+
+function makeVocabularySessionJson(session: Omit<VocabularySession, "resultJson"> | VocabularySession): VocabularySessionJson {
+  return {
+    session_id: session.id,
+    student: session.student,
+    exam: session.exam,
+    module: "vocabulary",
+    pack_id: session.packId,
+    mode: session.mode,
+    started_at: session.startedAt,
+    finished_at: session.finishedAt,
+    total_items: session.summary.total,
+    correct: session.summary.correct,
+    incorrect: session.summary.incorrect,
+    unsure: session.summary.unsure,
+    blank: session.summary.blank,
+    accuracy: session.summary.accuracy,
+    by_tag: session.summary.byTag,
+    by_type: session.summary.byType,
+    responses: session.responses.map((response) => ({
+      item_id: response.item.id,
+      type: response.item.type,
+      term: response.item.term,
+      mode: response.mode,
+      prompt: response.prompt,
+      user_answer: response.userAnswer,
+      accepted_answer: response.acceptedAnswer,
+      status: response.status,
+      time_ms: response.timeMs,
+      tags: response.item.tags,
+      difficulty: response.item.difficulty,
+      source_origin: response.item.source_origin,
+    })),
+  };
+}
+
+function updateVocabularyStats(stats: VocabularyStats, responses: VocabularyResponse[], finishedAt: string) {
+  const next = { ...stats };
+  responses.forEach((response) => {
+    const current = next[response.item.id] ?? { attempts: 0, correct: 0, incorrect: 0, unsure: 0, lastAttemptAt: finishedAt };
+    next[response.item.id] = {
+      attempts: current.attempts + 1,
+      correct: current.correct + (response.status === "correct" ? 1 : 0),
+      incorrect: current.incorrect + (response.status === "incorrect" || response.status === "blank" ? 1 : 0),
+      unsure: current.unsure + (response.status === "unsure" ? 1 : 0),
+      lastAttemptAt: finishedAt,
+    };
+  });
+  return next;
+}
+
+function updateVocabularyAggregateStats(
+  stats: VocabularyAggregateStats | undefined,
+  responses: VocabularyResponse[],
+  dimension: "tag" | "type",
+) {
+  const next: VocabularyAggregateStats = { ...(stats ?? {}) };
+  responses.forEach((response) => {
+    const keys = dimension === "tag" ? response.item.tags : [response.item.type];
+    keys.forEach((key) => {
+      const current = next[key] ?? { attempts: 0, correct: 0, incorrect: 0, unsure: 0 };
+      next[key] = {
+        attempts: current.attempts + 1,
+        correct: current.correct + (response.status === "correct" ? 1 : 0),
+        incorrect: current.incorrect + (response.status === "incorrect" || response.status === "blank" ? 1 : 0),
+        unsure: current.unsure + (response.status === "unsure" ? 1 : 0),
+      };
+    });
+  });
+  return next;
+}
+
+function downloadVocabularyJson(session: VocabularySession) {
+  downloadFile(`joel-c1-vocabulary-session-${session.finishedAt.replace(/[-:]/g, "-").replace("T", "-").slice(0, 16)}.json`, JSON.stringify(session.resultJson, null, 2), "application/json");
+}
+
+function downloadVocabularyCsv(session: VocabularySession) {
+  const header = ["session_id", "pack_id", "mode", "item_id", "type", "term", "status", "user_answer", "accepted_answer", "time_ms", "tags", "difficulty", "source_origin"];
+  const rows = session.responses.map((response) => [
+    session.id,
+    session.packId,
+    response.mode,
+    response.item.id,
+    response.item.type,
+    response.item.term,
+    response.status,
+    response.userAnswer,
+    response.acceptedAnswer,
+    response.timeMs,
+    response.item.tags.join(" | "),
+    response.item.difficulty,
+    response.item.source_origin,
+  ]);
+  downloadFile(`joel-c1-vocabulary-session-${session.finishedAt.replace(/[-:]/g, "-").replace("T", "-").slice(0, 16)}.csv`, [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\n"), "text/csv");
+}
+
+function labelVocabularyMode(mode: VocabularyMode) {
+  return {
+    flashcard: "Flashcard",
+    gap_fill: "Gap fill",
+    multiple_choice: "Multiple choice",
+    translation: "Translation recall",
+    mixed_review: "Mixed review",
+  }[mode];
+}
+
+function shuffle<T>(items: T[]) {
+  return [...items].sort(() => Math.random() - 0.5);
 }
 
 function getActiveSessionTotalTime(session: ActiveSession, currentIndex: number) {
@@ -1708,7 +2489,14 @@ function labelStatus(status: Result["status"]) {
 }
 
 function tabLabel(view: string) {
-  return { home: "Inicio", import: "Importar JSON", sessions: "Sesiones", review: "Revisión", charts: "Gráficas" }[view] ?? view;
+  return {
+    home: "Part 4",
+    import: "Importar JSON",
+    sessions: "Sesiones",
+    review: "Revisión",
+    charts: "Gráficas",
+    vocabulary: "Vocabulary",
+  }[view] ?? view;
 }
 
 createRoot(document.getElementById("app")!).render(
