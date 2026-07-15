@@ -185,6 +185,13 @@ select:focus {
   font-size: 1.03rem;
 }
 
+.field-label {
+  display: block;
+  margin-bottom: 0.35rem;
+  color: var(--ink);
+  font-weight: 800;
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));

@@ -82,9 +82,19 @@ type Summary = {
 
 type StoreState = {
   questions: Question[];
+  tests: TestPack[];
   sessions: Session[];
   importedAt: string | null;
   lastImport: ImportPreview | null;
+};
+
+type TestPack = {
+  id: string;
+  title: string;
+  sourceName: string;
+  importedAt: string;
+  questions: Question[];
+  preview: ImportPreview;
 };
 
 type ActiveSession = {
@@ -106,6 +116,7 @@ type SavedActiveSession = ActiveSession & {
 
 type ImportPreview = {
   testId: string;
+  title: string;
   name: string;
   total: number;
   parts: number[];
@@ -169,17 +180,50 @@ const REQUIRED_FIELDS = [
 function loadState(): StoreState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { questions: [], sessions: [], importedAt: null, lastImport: null };
+    if (!raw) return { questions: [], tests: [], sessions: [], importedAt: null, lastImport: null };
     const parsed = JSON.parse(raw) as Partial<StoreState>;
+    const migrated = migrateTests(parsed);
     return {
-      questions: Array.isArray(parsed.questions) ? parsed.questions : [],
+      questions: getQuestionsFromTests(migrated),
+      tests: migrated,
       sessions: Array.isArray(parsed.sessions) ? parsed.sessions.map(normalizeStoredSession) : [],
       importedAt: parsed.importedAt ?? null,
       lastImport: parsed.lastImport ?? null,
     };
   } catch {
-    return { questions: [], sessions: [], importedAt: null, lastImport: null };
+    return { questions: [], tests: [], sessions: [], importedAt: null, lastImport: null };
   }
+}
+
+function migrateTests(parsed: Partial<StoreState>) {
+  if (Array.isArray(parsed.tests) && parsed.tests.length) {
+    return parsed.tests.map(normalizeStoredTest);
+  }
+  const legacyQuestions = Array.isArray(parsed.questions) ? parsed.questions : [];
+  if (!legacyQuestions.length) return [];
+  const importedAt = parsed.importedAt ?? new Date().toISOString();
+  return [
+    makeTestPack({
+      questions: legacyQuestions,
+      title: "Legacy imported test",
+      sourceName: "Migrated questions",
+      importedAt,
+    }),
+  ];
+}
+
+function normalizeStoredTest(test: TestPack) {
+  const importedAt = test.importedAt ?? new Date().toISOString();
+  const title = test.title || test.sourceName || "Imported test";
+  const questions = Array.isArray(test.questions) ? test.questions : [];
+  return {
+    id: test.id || makeTestId(title, questions),
+    title,
+    sourceName: test.sourceName || title,
+    importedAt,
+    questions,
+    preview: test.preview ?? makeImportPreview(questions, title, title, importedAt, []),
+  };
 }
 
 function normalizeStoredSession(session: Session): Session {
@@ -208,7 +252,7 @@ function loadSavedActiveSession(): SavedActiveSession | null {
 function App() {
   const [store, setStore] = React.useState<StoreState>(loadState);
   const [view, setView] = React.useState<"home" | "import" | "sessions" | "review" | "charts">(
-    store.questions.length ? "home" : "import",
+    store.tests.length ? "home" : "import",
   );
   const [message, setMessage] = React.useState<{ type: "ok" | "error"; text: string } | null>(null);
   const [activeSession, setActiveSession] = React.useState<ActiveSession | null>(null);
@@ -218,6 +262,7 @@ function App() {
   const [reviewFilters, setReviewFilters] = React.useState({ status: "all", tag: "all", repeated: false });
   const [selectedSessionId, setSelectedSessionId] = React.useState<string | null>(null);
   const [justCompletedSessionId, setJustCompletedSessionId] = React.useState<string | null>(null);
+  const [selectedTestId, setSelectedTestId] = React.useState<string>(() => store.tests[0]?.id ?? "all");
 
   React.useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
@@ -271,7 +316,10 @@ function App() {
   const latestSession = selectedSessionId
     ? (store.sessions.find((session) => session.id === selectedSessionId) ?? store.sessions.at(-1) ?? null)
     : (store.sessions.at(-1) ?? null);
-  const tags = [...new Set(store.questions.flatMap((question) => question.tags))].sort((a, b) => a.localeCompare(b));
+  const allQuestions = getQuestionsFromTests(store.tests);
+  const selectedTest = store.tests.find((test) => test.id === selectedTestId) ?? store.tests[0] ?? null;
+  const selectedQuestions = selectedTestId === "all" ? allQuestions : (selectedTest?.questions ?? []);
+  const tags = [...new Set(allQuestions.flatMap((question) => question.tags))].sort((a, b) => a.localeCompare(b));
 
   function importQuestions(data: unknown) {
     const validation = validateQuestionFile(data);
@@ -280,14 +328,30 @@ function App() {
       return;
     }
     const importedAt = new Date().toISOString();
-    const preview = makeImportPreview(validation.questions, "Preguntas importadas", importedAt, validation.errors);
-    setStore((current) => {
-      const existing = new Map(current.questions.map((question) => [question.id, question]));
-      validation.questions.forEach((question) => existing.set(question.id, question));
-      return { ...current, questions: [...existing.values()], importedAt, lastImport: preview };
-    });
-    setMessage({ type: "ok", text: `Importadas ${validation.questions.length} preguntas.` });
+    const metadata = getTestMetadata(data, "Preguntas importadas");
+    const pack = makeTestPack({ questions: validation.questions, title: metadata.title, sourceName: metadata.title, importedAt, id: metadata.id });
+    if (!upsertTestPack(pack)) return;
+    setMessage({ type: "ok", text: `Importado test "${pack.title}" con ${validation.questions.length} preguntas.` });
     setView("import");
+  }
+
+  function upsertTestPack(pack: TestPack) {
+    const exists = store.tests.some((test) => test.id === pack.id || test.title === pack.title);
+    if (exists && !window.confirm(`Ya existe un test llamado "${pack.title}". ¿Quieres reemplazarlo?`)) {
+      return false;
+    }
+    setStore((current) => {
+      const tests = [...current.tests.filter((test) => test.id !== pack.id && test.title !== pack.title), pack];
+      return {
+        ...current,
+        tests,
+        questions: getQuestionsFromTests(tests),
+        importedAt: pack.importedAt,
+        lastImport: pack.preview,
+      };
+    });
+    setSelectedTestId(pack.id);
+    return true;
   }
 
   async function importFile(file: File | undefined) {
@@ -302,18 +366,15 @@ function App() {
         setMessage({ type: "error", text: validation.errors.join(" ") });
         setStore((current) => ({
           ...current,
-          lastImport: makeImportPreview([], file.name, new Date().toISOString(), validation.errors),
+          lastImport: makeImportPreview([], file.name.replace(/\.json$/i, ""), file.name, new Date().toISOString(), validation.errors),
         }));
         return;
       }
       const importedAt = new Date().toISOString();
-      const preview = makeImportPreview(validation.questions, file.name, importedAt, []);
-      setStore((current) => {
-        const existing = new Map(current.questions.map((question) => [question.id, question]));
-        validation.questions.forEach((question) => existing.set(question.id, question));
-        return { ...current, questions: [...existing.values()], importedAt, lastImport: preview };
-      });
-      setMessage({ type: "ok", text: `Importadas ${validation.questions.length} preguntas desde ${file.name}.` });
+      const metadata = getTestMetadata(data, file.name);
+      const pack = makeTestPack({ questions: validation.questions, title: metadata.title, sourceName: file.name, importedAt, id: metadata.id });
+      if (!upsertTestPack(pack)) return;
+      setMessage({ type: "ok", text: `Importado test "${pack.title}" con ${validation.questions.length} preguntas desde ${file.name}.` });
       setView("import");
     } catch (error) {
       setMessage({ type: "error", text: `JSON no válido: ${(error as Error).message}` });
@@ -329,7 +390,7 @@ function App() {
     }
   }
 
-  function startSession(questions: Question[], label: string) {
+  function startSession(questions: Question[], label: string, testId = makeTestId(label, questions)) {
     if (!questions.length) return;
     if (activeSession) {
       const confirmed = window.confirm("Ya hay un examen en curso. ¿Quieres descartarlo y empezar uno nuevo?");
@@ -345,7 +406,7 @@ function App() {
     const startedAt = Date.now();
     const session: ActiveSession = {
       id: crypto.randomUUID(),
-      testId: makeTestId(label, questions),
+      testId,
       label,
       startedAt,
       lastSavedAt: startedAt,
@@ -497,7 +558,7 @@ function App() {
           ? getHistoricallyFailedQuestions(store, 1)
           : mode === "twice"
             ? getHistoricallyFailedQuestions(store, 2)
-            : store.questions.filter((question) => question.tags.includes(tag));
+            : allQuestions.filter((question) => question.tags.includes(tag));
     const label =
       mode === "last"
         ? "Falladas última sesión"
@@ -506,7 +567,7 @@ function App() {
           : mode === "twice"
             ? "Falladas más de una vez"
             : `Tag: ${tag}`;
-    startSession(questions, label);
+    startSession(questions, label, mode === "tag" ? `tag-${slugify(tag)}` : `repeat-${mode}`);
   }
 
   if (activeSession) {
@@ -622,26 +683,49 @@ function App() {
               flexible y resultados exportables.
             </p>
             <div className="grid">
-              <Metric value={store.questions.length} label="preguntas importadas" />
+              <Metric value={store.tests.length} label="tests importados" />
+              <Metric value={allQuestions.length} label="preguntas totales" />
               <Metric value={store.sessions.length} label="sesiones guardadas" />
               <Metric value={latestSession ? `${latestSession.summary.accuracy}%` : "-"} label="último acierto" />
               <Metric value={latestSession ? formatDuration(latestSession.summary.totalTimeMs) : "-"} label="último tiempo" />
             </div>
+            <TestSelector
+              tests={store.tests}
+              selectedTestId={selectedTestId}
+              onSelect={setSelectedTestId}
+              className="top-space"
+            />
             <div className="actions top-space">
-              <button disabled={!store.questions.length} onClick={() => startSession(store.questions, "Todas las preguntas")}>
-                Empezar examen
+              <button
+                disabled={!selectedQuestions.length}
+                onClick={() =>
+                  startSession(
+                    selectedQuestions,
+                    selectedTestId === "all" ? "Todas las preguntas" : `Test: ${selectedTest?.title ?? "Seleccionado"}`,
+                    selectedTestId === "all" ? "all-questions" : (selectedTest?.id ?? makeTestId("selected", selectedQuestions)),
+                  )
+                }
+              >
+                Empezar test seleccionado
+              </button>
+              <button
+                className="secondary"
+                disabled={!allQuestions.length}
+                onClick={() => startSession(allQuestions, "Todas las preguntas", "all-questions")}
+              >
+                Todas las preguntas
               </button>
               <button
                 className="secondary"
                 disabled={!getLastFailedQuestions(store).length}
-                onClick={() => startSession(getLastFailedQuestions(store), "Falladas última sesión")}
+                onClick={() => startSession(getLastFailedQuestions(store), "Falladas última sesión", "repeat-last-failed")}
               >
                 Repetir falladas última sesión
               </button>
               <button
                 className="secondary"
                 disabled={!getHistoricallyFailedQuestions(store, 1).length}
-                onClick={() => startSession(getHistoricallyFailedQuestions(store, 1), "Falladas históricas")}
+                onClick={() => startSession(getHistoricallyFailedQuestions(store, 1), "Falladas históricas", "repeat-historical-failed")}
               >
                 Repetir falladas históricas
               </button>
@@ -671,7 +755,9 @@ function App() {
           justCompletedSessionId={justCompletedSessionId}
           onSelect={setSelectedSessionId}
           onDelete={deleteSession}
-          onRepeatFailed={(session) => startSession(getFailedQuestionsFromSession(store, session), `Falladas: ${session.label}`)}
+          onRepeatFailed={(session) =>
+            startSession(getFailedQuestionsFromSession(store, session), `Falladas: ${session.label}`, `repeat-failed-${session.testId}`)
+          }
         />
       )}
       {view === "review" && (
@@ -761,7 +847,71 @@ function ImportView({
         <h2>Vista previa segura</h2>
         {store.lastImport ? <SafeImportPreview preview={store.lastImport} /> : <Empty text="Todavía no hay preguntas importadas." />}
       </section>
+      <section className="panel top-space">
+        <h2>Tests disponibles</h2>
+        {store.tests.length ? <TestsOverview tests={store.tests} /> : <Empty text="No hay tests importados." />}
+      </section>
     </>
+  );
+}
+
+function TestSelector({
+  tests,
+  selectedTestId,
+  onSelect,
+  className,
+}: {
+  tests: TestPack[];
+  selectedTestId: string;
+  onSelect: (testId: string) => void;
+  className?: string;
+}) {
+  return (
+    <div className={className}>
+      <label className="field-label" htmlFor="test-select">
+        Test para la próxima sesión
+      </label>
+      <select id="test-select" value={selectedTestId} onChange={(event) => onSelect(event.target.value)} disabled={!tests.length}>
+        {tests.map((test) => (
+          <option value={test.id} key={test.id}>
+            {test.title} ({test.questions.length} preguntas)
+          </option>
+        ))}
+        {tests.length > 1 && <option value="all">Todas las preguntas ({getQuestionsFromTests(tests).length})</option>}
+      </select>
+      <p className="small">Por defecto se ejecuta solo el test seleccionado. “Todas las preguntas” es una opción explícita.</p>
+    </div>
+  );
+}
+
+function TestsOverview({ tests }: { tests: TestPack[] }) {
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Test</th>
+            <th>Fichero</th>
+            <th>Preguntas</th>
+            <th>Part</th>
+            <th>Tags</th>
+            <th>Dificultad</th>
+          </tr>
+        </thead>
+        <tbody>
+          {tests.map((test) => (
+            <tr key={test.id}>
+              <td>{test.title}</td>
+              <td>{test.sourceName}</td>
+              <td>{test.questions.length}</td>
+              <td>{test.preview.parts.join(", ") || "-"}</td>
+              <td>{test.preview.tags.map((tag) => <span className="pill" key={tag}>{tag}</span>)}</td>
+              <td>{test.preview.difficulties.join(", ") || "-"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -769,7 +919,8 @@ function SafeImportPreview({ preview }: { preview: ImportPreview }) {
   return (
     <div className="safe-preview">
       <div className="grid">
-        <Metric value={preview.name} label="test o fichero" />
+        <Metric value={preview.title} label="test" />
+        <Metric value={preview.name} label="fichero" />
         <Metric value={preview.total} label="preguntas" />
         <Metric value={preview.parts.length ? preview.parts.join(", ") : "-"} label="part" />
         <Metric value={preview.difficulties.length ? preview.difficulties.join(", ") : "-"} label="dificultad" />
@@ -1145,9 +1296,40 @@ function validateQuestionFile(data: unknown): { ok: true; errors: []; questions:
   };
 }
 
-function makeImportPreview(questions: Question[], name: string, importedAt: string, validationErrors: string[]): ImportPreview {
+function makeTestPack({
+  questions,
+  title,
+  sourceName,
+  importedAt,
+  id,
+}: {
+  questions: Question[];
+  title: string;
+  sourceName: string;
+  importedAt: string;
+  id?: string | null;
+}): TestPack {
+  const testId = id ? slugify(id) : makeTestId(title, questions);
   return {
-    testId: makeTestId(name, questions),
+    id: testId,
+    title,
+    sourceName,
+    importedAt,
+    questions,
+    preview: makeImportPreview(questions, title, sourceName, importedAt, []),
+  };
+}
+
+function makeImportPreview(
+  questions: Question[],
+  title: string,
+  name: string,
+  importedAt: string,
+  validationErrors: string[],
+): ImportPreview {
+  return {
+    testId: makeTestId(title, questions),
+    title,
     name,
     total: questions.length,
     parts: [...new Set(questions.map((question) => question.part))].sort((a, b) => a - b),
@@ -1157,6 +1339,26 @@ function makeImportPreview(questions: Question[], name: string, importedAt: stri
     ),
     importedAt,
     validationErrors,
+  };
+}
+
+function getQuestionsFromTests(tests: TestPack[]) {
+  const byCompositeId = new Map<string, Question>();
+  tests.forEach((test) => {
+    test.questions.forEach((question) => {
+      byCompositeId.set(`${test.id}:${question.id}`, question);
+    });
+  });
+  return [...byCompositeId.values()];
+}
+
+function getTestMetadata(data: unknown, fallback: string) {
+  const root = data as { test_id?: unknown; title?: unknown; name?: unknown };
+  const titleRaw = root?.title ?? root?.name ?? root?.test_id ?? fallback;
+  const title = String(titleRaw || fallback).replace(/\.json$/i, "").trim() || "Imported test";
+  return {
+    id: root?.test_id ? String(root.test_id) : null,
+    title,
   };
 }
 
@@ -1338,16 +1540,22 @@ function getLastFailedQuestions(store: StoreState) {
   const latest = store.sessions.at(-1);
   if (!latest) return [];
   const ids = new Set(latest.results.filter((result) => result.status !== "correct").map((result) => result.question.id));
-  return store.questions.filter((question) => ids.has(question.id));
+  return getQuestionsForSession(store, latest).filter((question) => ids.has(question.id));
 }
 
 function getHistoricallyFailedQuestions(store: StoreState, minFailures: number) {
-  return store.questions.filter((question) => getFailureCount(store, question.id) >= minFailures);
+  return getQuestionsFromTests(store.tests).filter((question) => getFailureCount(store, question.id) >= minFailures);
 }
 
 function getFailedQuestionsFromSession(store: StoreState, session: Session) {
   const ids = new Set(getFailedResults(session).map((result) => result.question.id));
-  return store.questions.filter((question) => ids.has(question.id));
+  return getQuestionsForSession(store, session).filter((question) => ids.has(question.id));
+}
+
+function getQuestionsForSession(store: StoreState, session: Session) {
+  const test = store.tests.find((item) => item.id === session.testId);
+  if (test) return test.questions;
+  return getQuestionsFromTests(store.tests);
 }
 
 function getFailedResults(session: Session) {
