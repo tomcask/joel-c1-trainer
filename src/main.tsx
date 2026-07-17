@@ -19,21 +19,29 @@ type Question = {
   exam?: string;
   paper?: string;
   part: number;
+  type: QuestionType;
   skill?: string;
   difficulty?: string;
   tags: string[];
   question: {
-    first_sentence: string;
-    keyword: string;
-    second_sentence: string;
-    word_limit_min: number;
-    word_limit_max: number;
+    first_sentence?: string;
+    keyword?: string;
+    second_sentence?: string;
+    text_before?: string;
+    gap?: string;
+    text_after?: string;
+    options?: Array<{ key: string; text: string }>;
+    base_word?: string;
+    word_limit_min?: number;
+    word_limit_max?: number;
   };
   answers: string[];
   alternative_answers?: string[];
   explanation: string;
   common_errors?: Array<{ answer: string; reason: string }>;
 };
+
+type QuestionType = "multiple_choice_cloze" | "open_cloze" | "word_formation" | "key_word_transformation";
 
 type ResponseState = {
   questionId: string;
@@ -55,6 +63,8 @@ type Result = {
   status: "correct" | "incorrect" | "blank";
   marked: boolean;
   timeMs: number;
+  selectedOptionText?: string;
+  correctOptionText?: string;
 };
 
 type Session = {
@@ -78,6 +88,8 @@ type Summary = {
   totalTimeMs: number;
   averageTimeMs: number;
   byTag: Record<string, { total: number; correct: number; incorrect: number; blank: number }>;
+  byPart: Record<string, { total: number; correct: number; incorrect: number; blank: number; timeMs: number }>;
+  byType: Record<string, { total: number; correct: number; incorrect: number; blank: number; timeMs: number }>;
 };
 
 type StoreState = {
@@ -121,6 +133,9 @@ type ImportPreview = {
   total: number;
   parts: number[];
   tags: string[];
+  types: QuestionType[];
+  partCounts: Record<string, number>;
+  typeCounts: Record<string, number>;
   difficulties: string[];
   importedAt: string;
   validationErrors: string[];
@@ -141,21 +156,35 @@ type SessionResultJson = {
   total_time_ms: number;
   average_time_ms: number;
   by_tag: Summary["byTag"];
+  tag_summary?: Array<Record<string, unknown>>;
+  part_summary?: Array<Record<string, unknown>>;
+  type_summary?: Array<Record<string, unknown>>;
   responses: Array<{
     question_id: string;
-    first_sentence: string;
-    keyword: string;
-    second_sentence: string;
+    part: number;
+    type: QuestionType;
+    skill?: string;
     joel_answer: string;
     accepted_answers: string[];
+    alternative_answers: string[];
     status: Result["status"];
+    correct: boolean;
     word_count: number;
-    word_limit_ok: boolean;
-    keyword_ok: boolean;
+    within_word_limit: boolean;
+    used_keyword?: boolean;
     answer_match: boolean;
-    time_ms: number;
+    time_spent_seconds: number;
     marked_for_review: boolean;
     tags: string[];
+    selected_option_key?: string;
+    selected_option_text?: string;
+    correct_option_key?: string;
+    correct_option_text?: string;
+    options?: Array<{ key: string; text: string }>;
+    base_word?: string;
+    first_sentence?: string;
+    keyword?: string;
+    second_sentence?: string;
     explanation: string;
     common_errors: Array<{ answer: string; reason: string }>;
   }>;
@@ -363,15 +392,13 @@ const VOCAB_REQUIRED_FIELDS = [
 const REQUIRED_FIELDS = [
   "id",
   "part",
+  "type",
   "tags",
-  "question.first_sentence",
-  "question.keyword",
-  "question.second_sentence",
-  "question.word_limit_min",
-  "question.word_limit_max",
+  "question",
   "answers",
   "explanation",
 ];
+const QUESTION_TYPES: QuestionType[] = ["multiple_choice_cloze", "open_cloze", "word_formation", "key_word_transformation"];
 
 function loadState(): StoreState {
   try {
@@ -379,12 +406,15 @@ function loadState(): StoreState {
     if (!raw) return { questions: [], tests: [], sessions: [], importedAt: null, lastImport: null };
     const parsed = JSON.parse(raw) as Partial<StoreState>;
     const migrated = migrateTests(parsed);
+    const migratedQuestions = getQuestionsFromTests(migrated);
     return {
-      questions: getQuestionsFromTests(migrated),
+      questions: migratedQuestions,
       tests: migrated,
       sessions: Array.isArray(parsed.sessions) ? parsed.sessions.map(normalizeStoredSession) : [],
       importedAt: parsed.importedAt ?? null,
-      lastImport: parsed.lastImport ?? null,
+      lastImport: parsed.lastImport
+        ? normalizeImportPreview(parsed.lastImport, migratedQuestions, parsed.lastImport.title ?? "Imported test", parsed.lastImport.name ?? "Imported test", parsed.importedAt ?? new Date().toISOString())
+        : null,
     };
   } catch {
     return { questions: [], tests: [], sessions: [], importedAt: null, lastImport: null };
@@ -411,21 +441,26 @@ function migrateTests(parsed: Partial<StoreState>) {
 function normalizeStoredTest(test: TestPack) {
   const importedAt = test.importedAt ?? new Date().toISOString();
   const title = test.title || test.sourceName || "Imported test";
-  const questions = Array.isArray(test.questions) ? test.questions : [];
+  const questions = Array.isArray(test.questions) ? test.questions.map(normalizeQuestion) : [];
   return {
     id: test.id || makeTestId(title, questions),
     title,
     sourceName: test.sourceName || title,
     importedAt,
     questions,
-    preview: test.preview ?? makeImportPreview(questions, title, title, importedAt, []),
+    preview: normalizeImportPreview(test.preview, questions, title, test.sourceName || title, importedAt),
   };
 }
 
 function normalizeStoredSession(session: Session): Session {
+  const results = Array.isArray(session.results)
+    ? session.results.map((result) => ({ ...result, question: normalizeQuestion(result.question) }))
+    : [];
   const normalized: Session = {
     ...session,
-    testId: session.testId ?? makeTestId(session.label ?? "session", session.results?.map((result) => result.question) ?? []),
+    results,
+    summary: normalizeSummary(session.summary, results),
+    testId: session.testId ?? makeTestId(session.label ?? "session", results.map((result) => result.question) ?? []),
     status: "completed",
     resultJson: session.resultJson ?? ({} as SessionResultJson),
   };
@@ -459,6 +494,9 @@ function App() {
   const [selectedSessionId, setSelectedSessionId] = React.useState<string | null>(null);
   const [justCompletedSessionId, setJustCompletedSessionId] = React.useState<string | null>(null);
   const [selectedTestId, setSelectedTestId] = React.useState<string>(() => store.tests[0]?.id ?? "all");
+  const [partFilter, setPartFilter] = React.useState("all");
+  const [typeFilter, setTypeFilter] = React.useState("all");
+  const [tagFilter, setTagFilter] = React.useState("all");
 
   React.useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
@@ -514,8 +552,14 @@ function App() {
     : (store.sessions.at(-1) ?? null);
   const allQuestions = getQuestionsFromTests(store.tests);
   const selectedTest = store.tests.find((test) => test.id === selectedTestId) ?? store.tests[0] ?? null;
-  const selectedQuestions = selectedTestId === "all" ? allQuestions : (selectedTest?.questions ?? []);
+  const selectedQuestions = filterUseOfEnglishQuestions(selectedTestId === "all" ? allQuestions : (selectedTest?.questions ?? []), {
+    part: partFilter,
+    type: typeFilter,
+    tag: tagFilter,
+  });
   const tags = [...new Set(allQuestions.flatMap((question) => question.tags))].sort((a, b) => a.localeCompare(b));
+  const availableParts = [...new Set((selectedTestId === "all" ? allQuestions : (selectedTest?.questions ?? [])).map((q) => q.part))].sort();
+  const availableTypes = [...new Set((selectedTestId === "all" ? allQuestions : (selectedTest?.questions ?? [])).map((q) => q.type))].sort();
 
   function importQuestions(data: unknown) {
     const validation = validateQuestionFile(data);
@@ -747,6 +791,7 @@ function App() {
   }
 
   function startRepeat(mode: string, tag: string) {
+    const part = Number(tag);
     const questions =
       mode === "last"
         ? getLastFailedQuestions(store)
@@ -754,22 +799,29 @@ function App() {
           ? getHistoricallyFailedQuestions(store, 1)
           : mode === "twice"
             ? getHistoricallyFailedQuestions(store, 2)
-            : allQuestions.filter((question) => question.tags.includes(tag));
+            : mode === "failed_part"
+              ? getHistoricallyFailedQuestions(store, 1).filter((question) => question.part === part)
+              : mode === "failed_type"
+                ? getHistoricallyFailedQuestions(store, 1).filter((question) => question.type === tag)
+                : allQuestions.filter((question) => question.tags.includes(tag));
     const label =
       mode === "last"
         ? "Falladas última sesión"
         : mode === "historical"
           ? "Falladas históricas"
-          : mode === "twice"
-            ? "Falladas más de una vez"
-            : `Tag: ${tag}`;
+        : mode === "twice"
+          ? "Falladas más de una vez"
+          : mode === "failed_part"
+            ? `Falladas Part ${tag}`
+            : mode === "failed_type"
+              ? `Falladas ${labelQuestionType(tag)}`
+          : `Tag: ${tag}`;
     startSession(questions, label, mode === "tag" ? `tag-${slugify(tag)}` : `repeat-${mode}`);
   }
 
   if (activeSession) {
     const question = activeSession.questions[currentIndex];
     const response = activeSession.responses[question.id];
-    const parts = splitSecondSentence(question.question.second_sentence);
     return (
       <Shell store={store}>
         <section className="panel">
@@ -788,32 +840,14 @@ function App() {
             </div>
           </div>
           <p className="instruction">
-            Complete the second sentence so that it has a similar meaning to the first sentence, using the word given.
-            Do not change the word given. You must use between {question.question.word_limit_min} and{" "}
-            {question.question.word_limit_max} words.
+            {getQuestionInstruction(question)}
           </p>
           <article className="question-card">
-            <div>
-              <div className="meta">First sentence</div>
-              <div className="first-sentence">{question.question.first_sentence}</div>
+            <div className="actions">
+              <span className="pill">Part {question.part}</span>
+              <span className="pill">{labelQuestionType(question.type)}</span>
             </div>
-            <div className="keyword">{question.question.keyword}</div>
-            <div>
-              <div className="meta">Second sentence</div>
-              <label className="sentence-line">
-                <span>{parts.before}</span>
-                <input
-                  className="inline-answer"
-                  value={response.answer}
-                  autoComplete="off"
-                  autoCapitalize="none"
-                  spellCheck={false}
-                  autoFocus
-                  onChange={(event) => patchCurrentResponse({ answer: event.target.value })}
-                />
-                <span>{parts.after}</span>
-              </label>
-            </div>
+            <ExamQuestionRenderer question={question} response={response} onAnswer={(answer) => patchCurrentResponse({ answer })} />
             <div className="question-tools">
               <label className="check-row">
                 <input
@@ -873,10 +907,9 @@ function App() {
       {view === "home" && (
         <>
           <section className="panel">
-            <h1>Práctica Cambridge C1 Advanced para Joel</h1>
+            <h1>Use of English Parts 1-4 para Joel</h1>
             <p className="lead">
-              Entrenamiento específico de Key Word Transformations con fichero de preguntas, modo examen, corrección
-              flexible y resultados exportables.
+              Entrenamiento de Multiple Choice Cloze, Open Cloze, Word Formation y Key Word Transformations con modo examen, corrección al finalizar y resultados exportables.
             </p>
             <div className="grid">
               <Metric value={store.tests.length} label="tests importados" />
@@ -890,6 +923,17 @@ function App() {
               selectedTestId={selectedTestId}
               onSelect={setSelectedTestId}
               className="top-space"
+            />
+            <UseOfEnglishFilters
+              partFilter={partFilter}
+              typeFilter={typeFilter}
+              tagFilter={tagFilter}
+              parts={availableParts}
+              types={availableTypes}
+              tags={tags}
+              onPart={setPartFilter}
+              onType={setTypeFilter}
+              onTag={setTagFilter}
             />
             <div className="actions top-space">
               <button
@@ -939,7 +983,7 @@ function App() {
                 tiempo total y el tiempo por pregunta.
               </p>
             </div>
-            <RepeatPanel tags={tags} onStart={startRepeat} />
+            <RepeatPanel tags={tags} parts={availableParts} types={availableTypes} onStart={startRepeat} />
           </section>
         </>
       )}
@@ -982,7 +1026,7 @@ function Shell({
       <header className="topbar">
         <div className="brand">
           <strong>Joel C1 Trainer</strong>
-          <span>Use of English · Part 4</span>
+          <span>Use of English · Parts 1-4</span>
         </div>
         <div className="actions">
           <button className="secondary" disabled={!store.sessions.length || !onExportJson} onClick={onExportJson}>
@@ -1081,6 +1125,122 @@ function TestSelector({
   );
 }
 
+function UseOfEnglishFilters({
+  partFilter,
+  typeFilter,
+  tagFilter,
+  parts,
+  types,
+  tags,
+  onPart,
+  onType,
+  onTag,
+}: {
+  partFilter: string;
+  typeFilter: string;
+  tagFilter: string;
+  parts: number[];
+  types: QuestionType[];
+  tags: string[];
+  onPart: (value: string) => void;
+  onType: (value: string) => void;
+  onTag: (value: string) => void;
+}) {
+  return (
+    <div className="filter-row top-space">
+      <select value={partFilter} onChange={(event) => onPart(event.target.value)}>
+        <option value="all">Todas las parts</option>
+        {parts.map((part) => <option value={String(part)} key={part}>Part {part}</option>)}
+      </select>
+      <select value={typeFilter} onChange={(event) => onType(event.target.value)}>
+        <option value="all">Todos los tipos</option>
+        {types.map((type) => <option value={type} key={type}>{labelQuestionType(type)}</option>)}
+      </select>
+      <select value={tagFilter} onChange={(event) => onTag(event.target.value)}>
+        <option value="all">Todos los tags</option>
+        {tags.map((tag) => <option value={tag} key={tag}>{tag}</option>)}
+      </select>
+    </div>
+  );
+}
+
+function ExamQuestionRenderer({
+  question,
+  response,
+  onAnswer,
+}: {
+  question: Question;
+  response: ResponseState;
+  onAnswer: (answer: string) => void;
+}) {
+  if (question.type === "multiple_choice_cloze") {
+    return (
+      <div>
+        <div className="first-sentence">
+          {question.question.text_before} {question.question.gap ?? "____"} {question.question.text_after}
+        </div>
+        <div className="choice-grid top-space">
+          {(question.question.options ?? []).map((option) => (
+            <button
+              className={response.answer === option.key ? "" : "secondary"}
+              key={option.key}
+              onClick={() => onAnswer(option.key)}
+            >
+              {option.key}. {option.text}
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+  if (question.type === "open_cloze" || question.type === "word_formation") {
+    return (
+      <div>
+        {question.type === "word_formation" && <div className="keyword">Base word: {question.question.base_word}</div>}
+        <label className="sentence-line top-space">
+          <span>{question.question.text_before}</span>
+          <input
+            className="inline-answer short-answer"
+            value={response.answer}
+            autoComplete="off"
+            autoCapitalize="none"
+            spellCheck={false}
+            autoFocus
+            onChange={(event) => onAnswer(event.target.value)}
+          />
+          <span>{question.question.text_after}</span>
+        </label>
+      </div>
+    );
+  }
+  const parts = splitSecondSentence(question.question.second_sentence ?? "");
+  return (
+    <>
+      <div>
+        <div className="meta">First sentence</div>
+        <div className="first-sentence">{question.question.first_sentence}</div>
+      </div>
+      <div className="keyword">{question.question.keyword}</div>
+      <div>
+        <div className="meta">Second sentence</div>
+        <label className="sentence-line">
+          <span>{parts.before}</span>
+          <input
+            className="inline-answer"
+            value={response.answer}
+            autoComplete="off"
+            autoCapitalize="none"
+            spellCheck={false}
+            autoFocus
+            onChange={(event) => onAnswer(event.target.value)}
+          />
+          <span>{parts.after}</span>
+        </label>
+      </div>
+    </>
+  );
+}
+
 function TestsOverview({ tests }: { tests: TestPack[] }) {
   return (
     <div className="table-wrap">
@@ -1113,6 +1273,8 @@ function TestsOverview({ tests }: { tests: TestPack[] }) {
 }
 
 function SafeImportPreview({ preview }: { preview: ImportPreview }) {
+  const partCounts = preview.partCounts ?? {};
+  const typeCounts = preview.typeCounts ?? {};
   return (
     <div className="safe-preview">
       <div className="grid">
@@ -1121,6 +1283,18 @@ function SafeImportPreview({ preview }: { preview: ImportPreview }) {
         <Metric value={preview.total} label="preguntas" />
         <Metric value={preview.parts.length ? preview.parts.join(", ") : "-"} label="part" />
         <Metric value={preview.difficulties.length ? preview.difficulties.join(", ") : "-"} label="dificultad" />
+      </div>
+      <div className="top-space">
+        <strong>Distribución</strong>
+        <div className="actions top-space">
+          {Object.entries(partCounts).map(([label, total]) => <span className="pill" key={label}>{label}: {total}</span>)}
+        </div>
+      </div>
+      <div className="top-space">
+        <strong>Tipos detectados</strong>
+        <div className="actions top-space">
+          {Object.entries(typeCounts).map(([label, total]) => <span className="pill" key={label}>{label}: {total}</span>)}
+        </div>
       </div>
       <div className="top-space">
         <strong>Tags detectadas</strong>
@@ -1251,6 +1425,22 @@ function SessionDetail({ session }: { session: Session }) {
           </span>
         ))}
       </div>
+      <h3 className="top-space">Resumen por parts</h3>
+      <div className="actions">
+        {Object.entries(session.summary.byPart).map(([part, item]) => (
+          <span className="pill" key={part}>
+            Part {part}: {item.correct}/{item.total}
+          </span>
+        ))}
+      </div>
+      <h3 className="top-space">Resumen por type</h3>
+      <div className="actions">
+        {Object.entries(session.summary.byType).map(([type, item]) => (
+          <span className="pill" key={type}>
+            {labelQuestionType(type as QuestionType)}: {item.correct}/{item.total}
+          </span>
+        ))}
+      </div>
       <h3 className="top-space">Errores y respuestas</h3>
       <div className="review-list">
         {(failed.length ? failed : session.results).map((result) => <ReviewItem key={result.question.id} result={result} />)}
@@ -1327,18 +1517,58 @@ function ReviewItem({ result }: { result: Result }) {
       <h3>
         {result.question.id} <span className={`pill ${statusClass}`}>{labelStatus(result.status)}</span>
       </h3>
-      <p><strong>First sentence:</strong> {result.question.question.first_sentence}</p>
-      <p><strong>Keyword:</strong> {result.question.question.keyword}</p>
-      <p><strong>Second sentence:</strong> {result.question.question.second_sentence}</p>
+      <div className="actions">
+        <span className="pill">Part {result.question.part}</span>
+        <span className="pill">{labelQuestionType(result.question.type)}</span>
+      </div>
+      <ReviewQuestionDetails result={result} />
       <p><strong>Respuesta de Joel:</strong> {result.answer || "—"}</p>
       <p><strong>Respuesta correcta:</strong> {result.acceptedAnswers.join(" · ")}</p>
-      <p><strong>Límite de palabras:</strong> {result.wordLimitOk ? "Sí" : "No"} · <strong>Keyword usada:</strong> {result.keywordOk ? "Sí" : "No"}</p>
+      {result.question.type !== "multiple_choice_cloze" && (
+        <p><strong>Límite de palabras:</strong> {result.wordLimitOk ? "Sí" : "No"}{result.question.type === "key_word_transformation" ? ` · Keyword usada: ${result.keywordOk ? "Sí" : "No"}` : ""}</p>
+      )}
       <p><strong>Explicación:</strong> {result.question.explanation}</p>
       {!!result.question.common_errors?.length && (
         <p><strong>Common errors:</strong> {result.question.common_errors.map((item) => `${item.answer}: ${item.reason}`).join(" · ")}</p>
       )}
       <div className="actions">{result.question.tags.map((tag) => <span className="pill" key={tag}>{tag}</span>)}</div>
     </article>
+  );
+}
+
+function ReviewQuestionDetails({ result }: { result: Result }) {
+  const q = result.question;
+  if (q.type === "multiple_choice_cloze") {
+    return (
+      <div>
+        <p><strong>Texto:</strong> {q.question.text_before} {q.question.gap ?? "____"} {q.question.text_after}</p>
+        <div className="review-list">
+          {(q.question.options ?? []).map((option) => (
+            <span className={`pill ${option.key === q.answers[0] ? "good" : option.key === result.answer ? "bad" : ""}`} key={option.key}>
+              {option.key}. {option.text}
+            </span>
+          ))}
+        </div>
+      </div>
+    );
+  }
+  if (q.type === "open_cloze") {
+    return <p><strong>Frase:</strong> {q.question.text_before} ____ {q.question.text_after}</p>;
+  }
+  if (q.type === "word_formation") {
+    return (
+      <>
+        <p><strong>Base word:</strong> {q.question.base_word}</p>
+        <p><strong>Frase:</strong> {q.question.text_before} ____ {q.question.text_after}</p>
+      </>
+    );
+  }
+  return (
+    <>
+      <p><strong>First sentence:</strong> {q.question.first_sentence}</p>
+      <p><strong>Keyword:</strong> {q.question.keyword}</p>
+      <p><strong>Second sentence:</strong> {q.question.second_sentence}</p>
+    </>
   );
 }
 
@@ -1926,12 +2156,24 @@ function SummaryTable({
   );
 }
 
-function RepeatPanel({ tags, onStart }: { tags: string[]; onStart: (mode: string, tag: string) => void }) {
+function RepeatPanel({
+  tags,
+  parts,
+  types,
+  onStart,
+}: {
+  tags: string[];
+  parts: number[];
+  types: QuestionType[];
+  onStart: (mode: string, value: string) => void;
+}) {
   const [mode, setMode] = React.useState("last");
-  const [tag, setTag] = React.useState(tags[0] ?? "");
+  const [value, setValue] = React.useState(tags[0] ?? "");
   React.useEffect(() => {
-    if (!tag && tags[0]) setTag(tags[0]);
-  }, [tag, tags]);
+    const options = getRepeatOptions(mode, tags, parts, types);
+    if (!options.includes(value)) setValue(options[0] ?? "");
+  }, [mode, value, tags, parts, types]);
+  const options = getRepeatOptions(mode, tags, parts, types);
   return (
     <div className="panel">
       <h2>Crear repetición</h2>
@@ -1940,19 +2182,28 @@ function RepeatPanel({ tags, onStart }: { tags: string[]; onStart: (mode: string
           <option value="last">Falladas en la última sesión</option>
           <option value="historical">Falladas históricamente</option>
           <option value="twice">Falladas más de una vez</option>
+          <option value="failed_part">Falladas por part</option>
+          <option value="failed_type">Falladas por type</option>
           <option value="tag">Preguntas de un tag concreto</option>
         </select>
-        <select value={tag} disabled={!tags.length} onChange={(event) => setTag(event.target.value)}>
-          {tags.map((item) => (
+        <select value={value} disabled={!options.length || ["last", "historical", "twice"].includes(mode)} onChange={(event) => setValue(event.target.value)}>
+          {options.map((item) => (
             <option value={item} key={item}>
-              {item}
+              {mode === "failed_type" ? labelQuestionType(item) : mode === "failed_part" ? `Part ${item}` : item}
             </option>
           ))}
         </select>
-        <button onClick={() => onStart(mode, tag)}>Crear sesión</button>
+        <button onClick={() => onStart(mode, value)}>Crear sesión</button>
       </div>
     </div>
   );
+}
+
+function getRepeatOptions(mode: string, tags: string[], parts: number[], types: QuestionType[]) {
+  if (mode === "failed_part") return parts.map(String);
+  if (mode === "failed_type") return types;
+  if (mode === "tag") return tags;
+  return [""];
 }
 
 function Metric({ value, label }: { value: string | number; label: string }) {
@@ -1977,21 +2228,17 @@ function validateQuestionFile(data: unknown): { ok: true; errors: []; questions:
   }
   const ids = new Set<string>();
   questions.forEach((item, index) => {
-    const q = item as Partial<Question>;
+    const q = normalizeQuestion(item as Question);
     const prefix = `Pregunta ${index + 1}${q?.id ? ` (${q.id})` : ""}:`;
-    REQUIRED_FIELDS.forEach((field) => {
+    ["id", "part", "type", "tags", "question", "answers", "explanation"].forEach((field) => {
       const value = getPath(q, field);
       if (value === undefined || value === null || value === "") errors.push(`${prefix} falta ${field}.`);
     });
-    if (q?.part !== 4) errors.push(`${prefix} part debe ser 4.`);
+    if (!QUESTION_TYPES.includes(q.type)) errors.push(`${prefix} type no soportado: ${q.type}.`);
     if (!Array.isArray(q?.tags)) errors.push(`${prefix} tags debe ser un array.`);
     if (!Array.isArray(q?.answers) || !q.answers.length) errors.push(`${prefix} answers debe tener al menos una respuesta.`);
     if (q?.alternative_answers && !Array.isArray(q.alternative_answers)) errors.push(`${prefix} alternative_answers debe ser un array si existe.`);
-    const min = Number(q?.question?.word_limit_min);
-    const max = Number(q?.question?.word_limit_max);
-    if (!Number.isInteger(min) || !Number.isInteger(max) || min < 1 || max < min) {
-      errors.push(`${prefix} word_limit_min y word_limit_max deben ser enteros válidos.`);
-    }
+    validateQuestionByType(q, prefix, errors);
     if (q?.id && ids.has(q.id)) errors.push(`${prefix} id duplicado.`);
     if (q?.id) ids.add(q.id);
   });
@@ -1999,10 +2246,12 @@ function validateQuestionFile(data: unknown): { ok: true; errors: []; questions:
   return {
     ok: true,
     errors: [],
-    questions: (questions as Question[]).map((question) => ({
+    questions: (questions as Question[]).map((rawQuestion) => {
+      const question = normalizeQuestion(rawQuestion);
+      return {
       exam: question.exam || "C1 Advanced",
       paper: question.paper || "Use of English",
-      skill: question.skill || "key_word_transformation",
+      skill: question.skill || question.type,
       difficulty: question.difficulty || "medium",
       common_errors: Array.isArray(question.common_errors) ? question.common_errors : [],
       alternative_answers: Array.isArray(question.alternative_answers) ? question.alternative_answers : [],
@@ -2012,11 +2261,50 @@ function validateQuestionFile(data: unknown): { ok: true; errors: []; questions:
       answers: question.answers.map(String),
       question: {
         ...question.question,
-        word_limit_min: Number(question.question.word_limit_min),
-        word_limit_max: Number(question.question.word_limit_max),
+        word_limit_min: Number(question.question.word_limit_min ?? defaultWordLimit(question).min),
+        word_limit_max: Number(question.question.word_limit_max ?? defaultWordLimit(question).max),
       },
-    })),
+    };
+    }),
   };
+}
+
+function validateQuestionByType(q: Question, prefix: string, errors: string[]) {
+  if (q.type === "multiple_choice_cloze") {
+    ["text_before", "text_after", "options"].forEach((field) => {
+      if (getPath(q.question, field) === undefined || getPath(q.question, field) === "") errors.push(`${prefix} falta question.${field}.`);
+    });
+    const options = q.question.options ?? [];
+    if (!Array.isArray(options) || options.length < 4) errors.push(`${prefix} question.options debe tener al menos 4 opciones.`);
+    options.forEach((option, index) => {
+      if (!option.key || !option.text) errors.push(`${prefix} option ${index + 1} debe tener key y text.`);
+    });
+    const optionKeys = new Set(options.map((option) => option.key));
+    q.answers.forEach((answer) => {
+      if (!optionKeys.has(answer)) errors.push(`${prefix} answers contiene una key que no existe en options: ${answer}.`);
+    });
+    return;
+  }
+  if (q.type === "open_cloze") {
+    ["text_before", "text_after"].forEach((field) => {
+      if (getPath(q.question, field) === undefined || getPath(q.question, field) === "") errors.push(`${prefix} falta question.${field}.`);
+    });
+    return;
+  }
+  if (q.type === "word_formation") {
+    ["text_before", "text_after", "base_word"].forEach((field) => {
+      if (getPath(q.question, field) === undefined || getPath(q.question, field) === "") errors.push(`${prefix} falta question.${field}.`);
+    });
+    return;
+  }
+  ["first_sentence", "keyword", "second_sentence", "word_limit_min", "word_limit_max"].forEach((field) => {
+    if (getPath(q.question, field) === undefined || getPath(q.question, field) === "") errors.push(`${prefix} falta question.${field}.`);
+  });
+  const min = Number(q.question.word_limit_min);
+  const max = Number(q.question.word_limit_max);
+  if (!Number.isInteger(min) || !Number.isInteger(max) || min < 1 || max < min) {
+    errors.push(`${prefix} word_limit_min y word_limit_max deben ser enteros válidos.`);
+  }
 }
 
 function makeTestPack({
@@ -2056,12 +2344,76 @@ function makeImportPreview(
     name,
     total: questions.length,
     parts: [...new Set(questions.map((question) => question.part))].sort((a, b) => a - b),
+    types: [...new Set(questions.map((question) => question.type))].sort(),
+    partCounts: countBy(questions, (question) => `Part ${question.part} — ${labelQuestionType(question.type)}`),
+    typeCounts: countBy(questions, (question) => labelQuestionType(question.type)),
     tags: [...new Set(questions.flatMap((question) => question.tags))].sort((a, b) => a.localeCompare(b)),
     difficulties: [...new Set(questions.map((question) => question.difficulty).filter(Boolean) as string[])].sort((a, b) =>
       a.localeCompare(b),
     ),
     importedAt,
     validationErrors,
+  };
+}
+
+function normalizeImportPreview(
+  preview: ImportPreview | null | undefined,
+  questions: Question[],
+  title: string,
+  name: string,
+  importedAt: string,
+): ImportPreview {
+  if (!preview) return makeImportPreview(questions, title, name, importedAt, []);
+  return {
+    ...preview,
+    title: preview.title ?? title,
+    name: preview.name ?? name,
+    total: preview.total ?? questions.length,
+    parts: preview.parts ?? [...new Set(questions.map((question) => question.part))].sort((a, b) => a - b),
+    types: preview.types ?? [...new Set(questions.map((question) => question.type))].sort(),
+    partCounts: preview.partCounts ?? countBy(questions, (question) => `Part ${question.part} — ${labelQuestionType(question.type)}`),
+    typeCounts: preview.typeCounts ?? countBy(questions, (question) => labelQuestionType(question.type)),
+    tags: preview.tags ?? [...new Set(questions.flatMap((question) => question.tags))].sort((a, b) => a.localeCompare(b)),
+    difficulties: preview.difficulties ?? [],
+    importedAt: preview.importedAt ?? importedAt,
+    validationErrors: preview.validationErrors ?? [],
+  };
+}
+
+function normalizeQuestion(question: Question): Question {
+  const type = (question.type ?? (Number(question.part) === 4 ? "key_word_transformation" : "")) as QuestionType;
+  return {
+    ...question,
+    type,
+    part: Number(question.part),
+    question: {
+      ...(question.question ?? {}),
+      word_limit_min: Number(question.question?.word_limit_min ?? defaultWordLimit({ ...question, type }).min),
+      word_limit_max: Number(question.question?.word_limit_max ?? defaultWordLimit({ ...question, type }).max),
+    },
+  };
+}
+
+function defaultWordLimit(question: Pick<Question, "type">) {
+  if (question.type === "key_word_transformation") return { min: 3, max: 6 };
+  return { min: 1, max: 1 };
+}
+
+function countBy<T>(items: T[], getKey: (item: T) => string) {
+  return items.reduce<Record<string, number>>((acc, item) => {
+    const key = getKey(item);
+    acc[key] = (acc[key] ?? 0) + 1;
+    return acc;
+  }, {});
+}
+
+function normalizeSummary(summary: Summary | undefined, results: Result[]): Summary {
+  const fallback = summarizeResults(results, 0, results.reduce((sum, result) => sum + result.timeMs, 0));
+  return {
+    ...fallback,
+    ...(summary ?? {}),
+    byPart: summary?.byPart ?? fallback.byPart,
+    byType: summary?.byType ?? fallback.byType,
   };
 }
 
@@ -2083,6 +2435,31 @@ function getTestMetadata(data: unknown, fallback: string) {
     id: root?.test_id ? String(root.test_id) : null,
     title,
   };
+}
+
+function filterUseOfEnglishQuestions(questions: Question[], filters: { part: string; type: string; tag: string }) {
+  return questions.filter((question) => {
+    if (filters.part !== "all" && question.part !== Number(filters.part)) return false;
+    if (filters.type !== "all" && question.type !== filters.type) return false;
+    if (filters.tag !== "all" && !question.tags.includes(filters.tag)) return false;
+    return true;
+  });
+}
+
+function labelQuestionType(type: QuestionType | string) {
+  return {
+    multiple_choice_cloze: "Multiple Choice Cloze",
+    open_cloze: "Open Cloze",
+    word_formation: "Word Formation",
+    key_word_transformation: "Key Word Transformations",
+  }[type] ?? type;
+}
+
+function getQuestionInstruction(question: Question) {
+  if (question.type === "multiple_choice_cloze") return "Choose the option A, B, C or D which best completes the sentence.";
+  if (question.type === "open_cloze") return "Write the word which best fits the gap. Do not show answers until the exam is finished.";
+  if (question.type === "word_formation") return "Use the word given in capitals to form a word that fits the gap.";
+  return `Complete the second sentence so that it has a similar meaning to the first sentence, using the word given. Do not change the word given. You must use between ${question.question.word_limit_min} and ${question.question.word_limit_max} words.`;
 }
 
 function makeTestId(label: string, questions: Question[]) {
@@ -2583,11 +2960,13 @@ function gradeAnswer(question: Question, answer: string, response: ResponseState
   const acceptedAnswers = [...question.answers, ...(question.alternative_answers ?? [])];
   const normalizedAccepted = acceptedAnswers.map(normalizeAnswer);
   const wordCount = countWords(answer);
-  const wordLimitOk = wordCount >= question.question.word_limit_min && wordCount <= question.question.word_limit_max;
-  const keywordOk = normalizedAnswer.includes(normalizeAnswer(question.question.keyword));
+  const wordLimitOk = wordCount >= Number(question.question.word_limit_min ?? 1) && wordCount <= Number(question.question.word_limit_max ?? 1);
+  const keywordOk = question.type === "key_word_transformation" ? normalizedAnswer.includes(normalizeAnswer(question.question.keyword ?? "")) : true;
   const blank = !normalizedAnswer;
-  const answerMatch = normalizedAccepted.includes(normalizedAnswer);
+  const answerMatch = question.type === "multiple_choice_cloze" ? question.answers.includes(answer) : normalizedAccepted.includes(normalizedAnswer);
   const correct = !blank && wordLimitOk && keywordOk && answerMatch;
+  const selectedOption = question.question.options?.find((option) => option.key === answer);
+  const correctOption = question.question.options?.find((option) => option.key === question.answers[0]);
   return {
     question,
     answer,
@@ -2600,6 +2979,8 @@ function gradeAnswer(question: Question, answer: string, response: ResponseState
     status: blank ? "blank" : correct ? "correct" : "incorrect",
     marked: response.marked,
     timeMs: response.timeMs,
+    selectedOptionText: selectedOption?.text,
+    correctOptionText: correctOption?.text,
   };
 }
 
@@ -2609,12 +2990,24 @@ function summarizeResults(results: Result[], startedAt: number, finishedAt: numb
   const blank = results.filter((result) => result.status === "blank").length;
   const incorrect = total - correct - blank;
   const byTag: Summary["byTag"] = {};
+  const byPart: Summary["byPart"] = {};
+  const byType: Summary["byType"] = {};
   results.forEach((result) => {
     result.question.tags.forEach((tag) => {
       byTag[tag] ||= { total: 0, correct: 0, incorrect: 0, blank: 0 };
       byTag[tag].total += 1;
       byTag[tag][result.status] += 1;
     });
+    const partKey = String(result.question.part);
+    byPart[partKey] ||= { total: 0, correct: 0, incorrect: 0, blank: 0, timeMs: 0 };
+    byPart[partKey].total += 1;
+    byPart[partKey][result.status] += 1;
+    byPart[partKey].timeMs += result.timeMs;
+    const typeKey = result.question.type;
+    byType[typeKey] ||= { total: 0, correct: 0, incorrect: 0, blank: 0, timeMs: 0 };
+    byType[typeKey].total += 1;
+    byType[typeKey][result.status] += 1;
+    byType[typeKey].timeMs += result.timeMs;
   });
   return {
     total,
@@ -2625,6 +3018,8 @@ function summarizeResults(results: Result[], startedAt: number, finishedAt: numb
     totalTimeMs: finishedAt - startedAt,
     averageTimeMs: total ? Math.round(results.reduce((sum, result) => sum + result.timeMs, 0) / total) : 0,
     byTag,
+    byPart,
+    byType,
   };
 }
 
@@ -2644,21 +3039,58 @@ function makeSessionResultJson(session: Omit<Session, "resultJson"> | Session): 
     total_time_ms: session.summary.totalTimeMs,
     average_time_ms: session.summary.averageTimeMs,
     by_tag: session.summary.byTag,
+    tag_summary: Object.entries(session.summary.byTag).map(([tag, item]) => ({
+      tag,
+      total: item.total,
+      correct: item.correct,
+      incorrect: item.incorrect,
+      blank: item.blank,
+      accuracy: item.total ? Math.round((item.correct / item.total) * 1000) / 10 : 0,
+    })),
+    part_summary: Object.entries(session.summary.byPart).map(([part, item]) => ({
+      part: Number(part),
+      total: item.total,
+      correct: item.correct,
+      incorrect: item.incorrect,
+      blank: item.blank,
+      accuracy: item.total ? Math.round((item.correct / item.total) * 1000) / 10 : 0,
+      average_time_seconds: item.total ? Math.round(item.timeMs / item.total / 1000) : 0,
+    })),
+    type_summary: Object.entries(session.summary.byType).map(([type, item]) => ({
+      type,
+      total: item.total,
+      correct: item.correct,
+      incorrect: item.incorrect,
+      blank: item.blank,
+      accuracy: item.total ? Math.round((item.correct / item.total) * 1000) / 10 : 0,
+      average_time_seconds: item.total ? Math.round(item.timeMs / item.total / 1000) : 0,
+    })),
     responses: session.results.map((result) => ({
       question_id: result.question.id,
-      first_sentence: result.question.question.first_sentence,
-      keyword: result.question.question.keyword,
-      second_sentence: result.question.question.second_sentence,
+      part: result.question.part,
+      type: result.question.type,
+      skill: result.question.skill,
       joel_answer: result.answer,
       accepted_answers: result.acceptedAnswers,
+      alternative_answers: result.question.alternative_answers ?? [],
       status: result.status,
+      correct: result.status === "correct",
       word_count: result.wordCount,
-      word_limit_ok: result.wordLimitOk,
-      keyword_ok: result.keywordOk,
+      within_word_limit: result.wordLimitOk,
+      used_keyword: result.question.type === "key_word_transformation" ? result.keywordOk : undefined,
       answer_match: result.answerMatch,
-      time_ms: result.timeMs,
+      time_spent_seconds: Math.round(result.timeMs / 1000),
       marked_for_review: result.marked,
       tags: result.question.tags,
+      selected_option_key: result.question.type === "multiple_choice_cloze" ? result.answer : undefined,
+      selected_option_text: result.selectedOptionText,
+      correct_option_key: result.question.type === "multiple_choice_cloze" ? result.question.answers[0] : undefined,
+      correct_option_text: result.correctOptionText,
+      options: result.question.type === "multiple_choice_cloze" ? result.question.question.options : undefined,
+      base_word: result.question.type === "word_formation" ? result.question.question.base_word : undefined,
+      first_sentence: result.question.type === "key_word_transformation" ? result.question.question.first_sentence : undefined,
+      keyword: result.question.type === "key_word_transformation" ? result.question.question.keyword : undefined,
+      second_sentence: result.question.type === "key_word_transformation" ? result.question.question.second_sentence : undefined,
       explanation: result.question.explanation,
       common_errors: result.question.common_errors ?? [],
     })),
@@ -2720,12 +3152,14 @@ function exportJson(store: StoreState) {
 }
 
 function exportCsv(store: StoreState) {
-  const header = ["session_id", "finished_at", "question_id", "status", "answer", "accepted_answers", "word_count", "word_limit_ok", "keyword_ok", "time_ms", "tags"];
+  const header = ["session_id", "finished_at", "question_id", "part", "type", "status", "answer", "accepted_answers", "word_count", "word_limit_ok", "keyword_ok", "time_ms", "tags"];
   const rows = store.sessions.flatMap((session) =>
     session.results.map((result) => [
       session.id,
       session.finishedAt,
       result.question.id,
+      result.question.part,
+      result.question.type,
       result.status,
       result.answer,
       result.acceptedAnswers.join(" | "),
@@ -2749,6 +3183,8 @@ function downloadSessionCsv(session: Session) {
     "test_id",
     "finished_at",
     "question_id",
+    "part",
+    "type",
     "status",
     "answer",
     "accepted_answers",
@@ -2761,9 +3197,11 @@ function downloadSessionCsv(session: Session) {
   const rows = session.results.map((result) => [
     session.id,
     session.testId,
-    session.finishedAt,
-    result.question.id,
-    result.status,
+      session.finishedAt,
+      result.question.id,
+      result.question.part,
+      result.question.type,
+      result.status,
     result.answer,
     result.acceptedAnswers.join(" | "),
     result.wordCount,
@@ -2851,7 +3289,7 @@ function labelStatus(status: Result["status"]) {
 
 function tabLabel(view: string) {
   return {
-    home: "Part 4",
+    home: "Use of English",
     import: "Importar JSON",
     sessions: "Sesiones",
     review: "Revisión",
